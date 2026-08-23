@@ -1,0 +1,58 @@
+{
+  "telegram": {
+    "api_id": 0,
+    "api_hash": "YOUR_API_HASH_HERE",
+    "phone_number": "+1234567890",
+    "session_name": "soul_agent"
+  },
+  "ai": {
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "sk-YOUR_API_KEY_HERE",
+    "chat_model": "gpt-4",
+    "vision_model": "gpt-4-vision-preview",
+    "vision_enabled": false,
+    "vision_fallback_to_caption": true,
+    "request_timeout_seconds": 300,
+    "temperature": 0.7,
+    "max_tokens": 8000
+  },
+  "soul": {
+    "soul_md_path": "Soul.md",
+    "initial_min_messages": 30,
+    "refresh_interval_minutes": 360,
+    "analysis_sample_size": 500,
+    "language": "es"
+  },
+  "responder": {
+    "auto_reply_enabled": true,
+    "group_reply_mode": "mention",
+    "group_reply_cooldown_seconds": 8,
+    "private_reply_cooldown_seconds": 3,
+    "max_context_messages": 25,
+    "skip_if_replied_recently_seconds": 30,
+    "prob_reply_in_always_mode": 0.35,
+    "ignore_my_own_messages_in_reply": true
+  },
+  "auth": {
+    "owner_user_id": 0,
+    "authorized_group_ids": [],
+    "authorized_user_ids": []
+  },
+  "logging": {
+    "level": "INFO",
+    "log_file": "logs/soul_agent.log"
+  },
+  "safety": {
+    "max_replies_per_minute": 8,
+    "do_not_reply_to_bots": true,
+    "do_not_reply_to_commands": true
+  },
+  "scan": {
+    "backfill_limit_per_chat": 200,
+    "scan_groups": true,
+    "scan_private": true,
+    "scan_channels": false,
+    "skip_empty_chats": true,
+    "report_progress_to_telegram": true
+  }
+}

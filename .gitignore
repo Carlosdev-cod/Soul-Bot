@@ -1,0 +1,24 @@
+# Dependencies
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Config with secrets
+config.json
+
+# Database & session (user data)
+data/
+session/
+logs/
+
+# Soul.md (generated per-user)
+Soul.md
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
