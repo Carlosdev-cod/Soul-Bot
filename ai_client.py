@@ -45,8 +45,8 @@ class AIClient:
         ai = cfg["ai"]
         self.base_url = ai["base_url"].rstrip("/")
         self.api_key = ai["api_key"]
-        self.chat_model = ai.get("chat_model", "gemini-3.6-flash")
-        self.vision_model = ai.get("vision_model", self.chat_model)
+        self.chat_model = ai.get("selected_model") or ai.get("chat_model", "gemini-3.6-flash")
+        self.vision_model = ai.get("selected_model") or ai.get("vision_model", self.chat_model)
         self.vision_enabled = ai.get("vision_enabled", True)
         self.vision_fallback_to_caption = ai.get("vision_fallback_to_caption", True)
         self.timeout = ai.get("request_timeout_seconds", 120)
@@ -63,6 +63,30 @@ class AIClient:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def list_models(self) -> list[str]:
+        """Devuelve los IDs de modelos publicados por el endpoint configurado."""
+        try:
+            r = await self._client.get("/models")
+            r.raise_for_status()
+            data = r.json()
+            models = data.get("data", [])
+            ids = {str(item.get("id")) for item in models if item.get("id")}
+            return sorted(ids, key=str.casefold)
+        except httpx.HTTPStatusError as e:
+            log.error("AI models HTTP %s: %s", e.response.status_code,
+                      e.response.text[:300])
+            raise AIError(f"AI models endpoint returned {e.response.status_code}") from e
+        except (httpx.RequestError, ValueError) as e:
+            log.error("AI models request error: %s", e)
+            raise AIError(f"Could not load AI models: {e}") from e
+
+    def set_model(self, model: str) -> None:
+        """Cambia el modelo activo en memoria y limpia la caché de visión."""
+        self.chat_model = model
+        self.vision_model = model
+        self._vision_supported = None
+        self._vision_checked_at = 0.0
 
     # -------------------------------------------------------------- helpers
     def _payload(self, messages: list[dict], model: str | None = None,

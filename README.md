@@ -195,6 +195,12 @@ Configuración relevante:
 - `/soul_set_mode mention` — responde si mencionan o responden al dueño.
 - `/soul_set_mode always` — responde aleatoriamente en grupos autorizados según `prob_reply_in_always_mode`.
 
+### Modelos de IA
+
+- `/models` — consulta `GET /models` del endpoint configurado y muestra sus IDs en botones inline.
+- Al seleccionar un modelo, queda guardado como `ai.selected_model` en `config.json` y se usa para chat y visión sin reiniciar.
+- El botón **Config.json** elimina la selección manual y vuelve a `ai.chat_model`/`ai.vision_model` definidos en el archivo.
+
 ### Autorización
 
 - `/soul_auth_chat` — autoriza el grupo o privado actual.

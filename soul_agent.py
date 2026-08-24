@@ -48,7 +48,7 @@ from typing import Any, Optional
 
 import httpx
 from pyrogram import Client, filters
-from pyrogram.types import Message, User
+from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, User
 from pyrogram.enums import ChatType
 
 from ai_client import AIClient, AIError
@@ -190,7 +190,8 @@ class SoulAgent:
         )
         async def _on_admin_cmd(client: Client, message: Message):
             text = (message.text or "").strip()
-            if text.startswith("/soul_"):
+            command = text.split(maxsplit=1)[0].lower() if text else ""
+            if command.startswith("/soul_") or command == "/models":
                 log.info("Admin command detected: %s", text)
                 await self._handle_admin_command(client, message)
                 return  # No procesar más handlers para este mensaje
@@ -203,6 +204,15 @@ class SoulAgent:
         @app.on_edited_message(filters.outgoing)
         async def _on_edit_outgoing(client: Client, message: Message):
             await self._capture_message(message, is_out=True, is_edit=True)
+
+        @app.on_callback_query()
+        async def _on_model_callback(client: Client, callback: CallbackQuery):
+            if not callback.data or not callback.data.startswith("models:"):
+                return
+            if not callback.from_user or not self.auth.is_owner(callback.from_user.id):
+                await callback.answer("Solo el dueño puede cambiar el modelo.", show_alert=True)
+                return
+            await self._handle_model_callback(callback)
 
         log.info("Handlers registered.")
 
@@ -499,6 +509,8 @@ class SoulAgent:
             summary = self.soul.last_learning_summary()
             await reply(summary if summary else
                         "⚠️ Aún no hay learning summary. Ejecuta /soul_now primero.")
+        elif cmd == "models":
+            await self._handle_models_command(message)
         elif cmd in ("soul_scan", "soul_scan_groups", "soul_scan_private"):
             await self._handle_scan(client, message, cmd, args)
         elif cmd == "soul_exclude":
@@ -513,6 +525,84 @@ class SoulAgent:
             await self._handle_delete_analyzed(message)
         elif cmd == "soul_delete_unanalyzed":
             await self._handle_delete_unanalyzed(message)
+
+    async def _handle_models_command(self, message: Message) -> None:
+        """Muestra los modelos disponibles y permite activar uno con botones."""
+        try:
+            models = await self.ai.list_models()
+        except AIError as e:
+            await message.reply(f"❌ No pude consultar los modelos de la API: {e}", quote=True)
+            return
+        if not models:
+            await message.reply("⚠️ El endpoint no publicó modelos disponibles.", quote=True)
+            return
+        await message.reply(
+            self._models_text(models),
+            quote=True,
+            reply_markup=self._models_keyboard(models),
+        )
+
+    def _models_text(self, models: list[str]) -> str:
+        configured = self.cfg.get("ai", {}).get("chat_model", "")
+        override = self.cfg.get("ai", {}).get("selected_model")
+        active = override or configured
+        source = "seleccionado por /models" if override else "config.json (por defecto)"
+        return (
+            "🤖 **Modelos disponibles en la API**\n\n"
+            f"Activo: `{active}`\n"
+            f"Origen: {source}\n\n"
+            "Pulsa un botón para usarlo en chat y visión.\n"
+            "‘Config.json’ quita la selección manual y vuelve al modelo definido en `config.json`."
+        )
+
+    def _models_keyboard(self, models: list[str]) -> InlineKeyboardMarkup:
+        buttons = [[InlineKeyboardButton(
+            "✅ Config.json (usar valor por defecto)",
+            callback_data="models:default",
+        )]]
+        override = self.cfg.get("ai", {}).get("selected_model")
+        configured = self.cfg.get("ai", {}).get("chat_model", "")
+        active = override or configured
+        for index in range(0, len(models), 2):
+            row = []
+            for model in models[index:index + 2]:
+                label = f"✅ {model}" if model == active else model
+                row.append(InlineKeyboardButton(label[:64], callback_data=f"models:set:{model}"))
+            buttons.append(row)
+        return InlineKeyboardMarkup(buttons)
+
+    async def _handle_model_callback(self, callback: CallbackQuery) -> None:
+        data = callback.data or ""
+        try:
+            models = await self.ai.list_models()
+            if data == "models:default":
+                self.cfg.get("ai", {}).pop("selected_model", None)
+                model = self.cfg.get("ai", {}).get("chat_model", "gemini-3.6-flash")
+                self.ai.set_model(model)
+                await callback.answer("Volviendo al modelo de config.json.")
+            elif data.startswith("models:set:"):
+                model = data.removeprefix("models:set:")
+                if model not in models:
+                    await callback.answer("Ese modelo ya no está disponible.", show_alert=True)
+                    return
+                self.cfg.setdefault("ai", {})["selected_model"] = model
+                self.ai.set_model(model)
+                await callback.answer(f"Modelo activo: {model}")
+            else:
+                await callback.answer()
+                return
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.cfg, f, indent=2, ensure_ascii=False)
+            if callback.message:
+                await callback.message.edit_text(
+                    self._models_text(models),
+                    reply_markup=self._models_keyboard(models),
+                )
+        except AIError as e:
+            await callback.answer(f"Error consultando modelos: {e}", show_alert=True)
+        except Exception as e:
+            log.exception("Model selection failed: %s", e)
+            await callback.answer("No se pudo aplicar el modelo.", show_alert=True)
 
     # -------------------------------------------------------------- scan
     async def _handle_scan(self, client: Client, message: Message,
@@ -893,6 +983,9 @@ _HELP_TEXT = """🪪 **Soul Agent** — comandos del dueño
 ⚙️ Configuración:
 /soul_set_mode mention — responder solo si te @mencionan o responden a ti (default)
 /soul_set_mode always — responder a una fracción de mensajes en grupos autorizados
+
+🤖 Modelo de IA:
+/models — consultar los modelos de la API y seleccionar uno con botones
 
 /soul_help — esta ayuda
 """
