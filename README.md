@@ -1,253 +1,241 @@
-<div align="center">
-
 # 🧬 Soul Bot
 
-### Tu clon de Telegram con personalidad propia
+Agente de Telegram basado en una **cuenta de usuario** que aprende el estilo de escritura del dueño y puede responder en chats autorizados con su personalidad, su tono y el contexto real de cada conversación.
 
-**Un agente de IA que aprende tu forma de escribir y responde como tú en Telegram.**
+> ⚠️ Automatizar una cuenta de usuario puede incumplir reglas de Telegram. Úsalo bajo tu responsabilidad, con autorización de los participantes y respetando la privacidad.
 
-[![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![DeepSeek](https://img.shields.io/badge/DeepSeek-Chat-000000?style=for-the-badge&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTEyIDJMMyAxMHYxMGgxOFYxMEwxMiAyeiIgZmlsbD0id2hpdGUiLz48L3N2Zz4=&logoColor=white)](https://deepseek.com)
-[![Gemini](https://img.shields.io/badge/Gemini-Flash-4285F4?style=for-the-badge&logo=google&logoColor=white)](https://gemini.google.com)
-[![Pyrogram](https://img.shields.io/badge/Pyrogram-2.2-0088CC?style=for-the-badge&logo=telegram&logoColor=white)](https://docs.pyrogram.org)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](LICENSE)
-[![Open Source](https://img.shields.io/badge/Open%20Source-❤️-green?style=for-the-badge)](LICENSE)
+## Qué hace
 
----
+- Captura tus mensajes y los analiza para construir `Soul.md`.
+- Escanea historial antiguo con `/soul_scan`.
+- Mantiene el contexto inmediato de cada chat en SQLite.
+- Resume temas, palabras clave, participantes frecuentes, tono y rol del dueño por chat.
+- Responde usando tres capas de información:
+  1. **Personalidad global:** `Soul.md`.
+  2. **Memoria del chat:** resumen persistente de esa conversación.
+  3. **Conversación inmediata:** los últimos mensajes del mismo chat.
+- Responde únicamente en grupos/usuarios autorizados.
+- Puede analizar imágenes si el endpoint de IA soporta visión.
 
-![Soul Bot Architecture](https://img.shields.io/badge/Architecture-Python%20%2B%20SQLite%20%2B%20Telegram%20API-blue?style=for-the-badge&logo=architecture&logoColor=white)
+## Arquitectura
 
-</div>
-
-## ✨ ¿Qué hace Soul Bot?
-
-Soul Bot es un **agente de cuenta de usuario** (no un bot de Telegram) que:
-
-1. **Aprende** tu estilo de escritura analizando todos los mensajes que envías
-2. **Genera** un `Soul.md` — tu perfil de personalidad digital
-3. **Responde como tú** en grupos y chats privados que autorices
-4. **Se actualiza solo** cada vez que acumula mensajes nuevos
-
-> 💡 No es un chatbot genérico. Es **tu clon digital** que habla como tú, usa tus modismos, y mantiene tu tono.
-
----
-
-## 🏗️ Arquitectura
-
-```
-┌─────────────────────────────────────────────────────┐
-│                   TELEGRAM                          │
-│              (Cuenta de usuario)                    │
-└──────────────┬──────────────────────┬───────────────┘
-               │                      │
-               ▼                      ▼
-┌──────────────────────┐  ┌───────────────────────────┐
-│   soul_agent.py      │  │     backfill.py           │
-│   (Pyrogram Client)  │  │   (Historical Scanner)    │
-│   ┌──────────────┐   │  │   ┌───────────────────┐   │
-│   │  Handlers    │   │  │   │ Dialog Iterator    │   │
-│   │  Commands    │   │  │   │ Message Fetcher    │   │
-│   │  Auto-Reply  │   │  │   │ Progress Reporter  │   │
-│   └──────────────┘   │  │   └───────────────────┘   │
-└──────────┬───────────┘  └───────────┬───────────────┘
-           │                          │
-           ▼                          ▼
-┌─────────────────────────────────────────────────────┐
-│              message_store.py                        │
-│              (SQLite + WAL Mode)                     │
-│   ┌──────────────────────────────────────────────┐  │
-│   │ messages table: id, ts, chat_id, text, is_out│  │
-│   │ analyzed_for_soul: 0 | 1                     │  │
-│   └──────────────────────────────────────────────┘  │
-└──────────┬──────────────────────────┬───────────────┘
-           │                          │
-           ▼                          ▼
-┌──────────────────────┐  ┌───────────────────────────┐
-│  soul_manager.py     │  │     responder.py           │
-│  (AI Personality     │  │   (Auto-Reply Engine)      │
-│   Generator)         │  │   ┌────────────────────┐   │
-│  ┌────────────────┐  │  │   │ Context Builder    │   │
-│  │ Soul.md Writer │  │  │   │ Decision Engine    │   │
-│  │ Prompt Builder │  │  │   │ Reply Generator    │   │
-│  └────────────────┘  │  │   └────────────────────┘   │
-└──────────┬───────────┘  └───────────┬───────────────┘
-           │                          │
-           ▼                          ▼
-┌─────────────────────────────────────────────────────┐
-│                ai_client.py                          │
-│          (OpenAI-Compatible API)                     │
-│     DeepSeek · Gemini · GPT · Any Provider          │
-└─────────────────────────────────────────────────────┘
+```text
+Telegram / cuenta de usuario
+          │
+          ▼
+     soul_agent.py
+   handlers + captura
+      │          │
+      ▼          ▼
+message_store  responder
+ SQLite         │
+      │         ├── contexto reciente del chat
+      │         ├── memoria contextual persistente
+      │         └── Soul.md + reglas de personalidad
+      ▼         ▼
+  soul_manager ─── ai_client.py
+  aprendizaje       API OpenAI-compatible
 ```
 
----
+### Memoria por chat
 
-## 🚀 Puesta en Marcha
+La tabla `chat_context` guarda una memoria resumida por `chat_id`:
 
-### Requisitos
+- `summary`: de qué se habla actualmente.
+- `topics`: temas recurrentes.
+- `keywords`: palabras clave.
+- `participants`: participantes frecuentes.
+- `my_role`: papel habitual del dueño en ese chat.
+- `tone`: tono dominante.
+- métricas y fecha de actualización.
 
-- Python 3.10+
-- Cuenta de Telegram con API credentials ([my.telegram.org](https://my.telegram.org))
-- API key de un proveedor de IA compatible con OpenAI (DeepSeek, Gemini, OpenAI, etc.)
+El resumen se actualiza como máximo cada 30 minutos por chat. La conversación reciente se consulta en cada respuesta, por lo que el agente puede reaccionar al tema actual aunque la memoria persistente todavía no se haya refrescado.
 
-### Instalación
+Después de `/soul_scan`, se actualizan en segundo plano los chats principales —por defecto, los 50 con más mensajes tuyos—. Los demás se actualizan automáticamente cuando reciben una conversación autorizada.
+
+El resumen es una ayuda para el modelo, no una instrucción: los mensajes recientes tienen prioridad y el agente debe evitar inventar información.
+
+## Requisitos
+
+- Python 3.10+ (recomendado 3.12).
+- Credenciales de Telegram desde [my.telegram.org](https://my.telegram.org).
+- API key de un proveedor compatible con `/v1/chat/completions`.
+- Dependencias de `requirements.txt`.
+
+## Instalación
 
 ```bash
-# Clonar el repo
 git clone https://github.com/Carlosdev-cod/Soul-Bot.git
 cd Soul-Bot
-
-# Crear entorno virtual
 python3 -m venv venv
 source venv/bin/activate
-
-# Instalar dependencias
 pip install -r requirements.txt
-
-# Configurar credenciales
 cp config.example.json config.json
-# Edita config.json con tus credenciales
 ```
 
-### Configuración
-
-Edita `config.json`:
+Edita `config.json` y completa tus credenciales. No subas este archivo: contiene secretos y está incluido en `.gitignore`.
 
 ```json
 {
   "telegram": {
     "api_id": 12345678,
-    "api_hash": "tu-api-hash-de-telegram",
-    "phone_number": "+5491155551234"
+    "api_hash": "tu-api-hash",
+    "phone_number": "+123456789",
+    "session_name": "soul_agent"
   },
   "ai": {
-    "base_url": "https://api.deepseek.com/v1",
-    "api_key": "sk-tu-api-key",
-    "chat_model": "deepseek-chat"
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "tu-api-key",
+    "chat_model": "gpt-4o-mini",
+    "vision_enabled": false
   },
   "auth": {
-    "owner_user_id": 123456789,
-    "authorized_group_ids": [-1001234567890]
+    "owner_user_id": 0,
+    "authorized_group_ids": [],
+    "authorized_user_ids": []
   }
 }
 ```
 
-### Ejecutar
+También puedes dejar `owner_user_id` en `0`: al iniciar sesión se asigna automáticamente a la cuenta conectada.
+
+## Ejecución
 
 ```bash
+source venv/bin/activate
 python soul_agent.py
 ```
 
-La primera vez pedirá un código de confirmación de Telegram. Ábrelo en la app de Telegram y pégalo.
+La primera ejecución puede pedir el código de inicio de sesión de Telegram y, si está activado, la contraseña de verificación en dos pasos.
 
----
+## Flujo recomendado para aprender tu estilo
 
-## 📋 Comandos
+1. Inicia el agente.
+2. Ejecuta `/soul_scan` para importar tus mensajes históricos.
+3. Ejecuta `/soul_now` para generar o actualizar `Soul.md`.
+4. Autoriza un grupo con `/soul_auth_chat` o un usuario con `/soul_auth_user`.
+5. Activa respuestas con `/soul_resume`.
+6. El agente usará el contexto de ese chat junto con tu personalidad global.
 
-| Comando | Descripción |
-|---|---|
-| `/soul_help` | Lista completa de comandos |
-| `/soul_status` | Estado del agente y métricas |
-| `/soul_now` | Refrescar Soul.md ahora |
-| `/soul_show` | Ver el Soul.md actual |
-| `/soul_pause` | Pausar auto-respuestas |
-| `/soul_resume` | Reanudar auto-respuestas |
-| `/soul_scan` | Escanear TODO el historial |
-| `/soul_scan <id>` | Escanear un chat específico |
-| `/soul_stats` | Estadísticas del almacén |
-| `/soul_delete` | Opciones para borrar mensajes |
-| `/soul_delete <chat_id>` | Borrar mensajes de un chat |
-| `/soul_delete --confirm` | Borrar todos tus mensajes |
-| `/soul_auth_chat` | Autorizar chat actual |
-| `/soul_set_mode mention` | Responder solo si te mencionan |
-| `/soul_set_mode always` | Responder a todos |
+`Soul.md` se actualiza automáticamente según `refresh_interval_minutes`, por defecto cada 6 horas.
 
----
+## Escaneo de historial
 
-## 🧠 ¿Cómo Aprende?
-
-```
-Tus mensajes → message_store.py → SQLite
-                                        ↓
-                              soul_manager.py (cada 6h)
-                                        ↓
-                              ┌─────────────────────┐
-                              │  DeepSeek / Gemini   │
-                              │  analiza tu estilo   │
-                              └──────────┬──────────┘
-                                         ↓
-                                    Soul.md
-                              (tu personalidad digital)
+```text
+/soul_scan                  todos los chats permitidos por la configuración
+/soul_scan <chat_id>        un chat concreto
+/soul_scan 123,456           varios chats
+/soul_scan_groups            solo grupos y supergrupos
+/soul_scan_private           solo chats privados
 ```
 
-1. **Captura**: Cada mensaje que envías se almacena en SQLite
-2. **Análisis**: Cada 6 horas, la IA analiza tus mensajes nuevos
-3. **Generación**: Actualiza `Soul.md` con tu patrón de escritura
-4. **Respuesta**: Cuando alguien te escribe, usa tu Soul.md como contexto
+Configuración relevante:
 
----
-
-## 🛡️ Seguridad
-
-- `config.json` con API keys **nunca** se sube al repo (`.gitignore`)
-- Solo responde en chats que **tú autorices**
-- Rate limiting integrado (máx 8 respuestas/minuto)
-- No responde a bots ni comandos
-- Soul.md es un archivo local, no se comparte
-
----
-
-## 📁 Estructura
-
-```
-Soul-Bot/
-├── soul_agent.py         # Cliente Pyrogram + handlers
-├── ai_client.py          # Wrapper de API compatible con OpenAI
-├── soul_manager.py       # Generación y refresh de Soul.md
-├── responder.py          # Motor de auto-respuestas
-├── message_store.py      # SQLite async para mensajes
-├── auth_manager.py       # Gestión de autorizaciones
-├── backfill.py           # Scanner de historial
-├── progress.py           # Barras de progreso
-├── config.example.json   # Plantilla de configuración
-├── requirements.txt      # Dependencias Python
-├── LICENSE               # MIT License
-└── README.md             # Este archivo
+```json
+"scan": {
+  "backfill_limit_per_chat": 200,
+  "scan_groups": true,
+  "scan_private": true,
+  "scan_channels": false,
+  "excluded_chat_ids": [],
+  "report_progress_to_telegram": true,
+  "context_refresh_limit": 50
+}
 ```
 
----
+`backfill_limit_per_chat` limita cuántos mensajes se recorren por chat en cada escaneo. El escaneo es deduplicado por `chat_id + message_id`, así que repetir `/soul_scan` no debería duplicar tus mensajes.
 
-## 🤝 Contribuir
+## Comandos
 
-Las contribuciones son bienvenidas. Abre un [issue](https://github.com/Carlosdev-cod/Soul-Bot/issues) o un [pull request](https://github.com/Carlosdev-cod/Soul-Bot/pulls).
+### Estado y aprendizaje
 
-1. Haz fork del repo
-2. Crea una branch (`git checkout -b feature/nueva-funcion`)
-3. Commit (`git commit -m 'Agregar nueva función'`)
-4. Push (`git push origin feature/nueva-funcion`)
-5. Abre un Pull Request
+- `/soul_help` — ayuda completa.
+- `/soul_status` — estado, autorización, límites y Soul.md.
+- `/soul_stats` — estadísticas del almacén y chats principales.
+- `/soul_now` o `/soul_refresh` — fuerza el refresh de `Soul.md`.
+- `/soul_show` — muestra el perfil actual.
+- `/soul_learn` — último resumen de lo aprendido.
 
----
+### Respuestas
 
-## 📄 Licencia
+- `/soul_pause` — pausa respuestas, mantiene la captura.
+- `/soul_resume` — reanuda respuestas.
+- `/soul_set_mode mention` — responde si mencionan o responden al dueño.
+- `/soul_set_mode always` — responde aleatoriamente en grupos autorizados según `prob_reply_in_always_mode`.
 
-Este proyecto está bajo la licencia MIT. Ver [LICENSE](LICENSE) para detalles.
+### Autorización
 
----
+- `/soul_auth_chat` — autoriza el grupo o privado actual.
+- `/soul_unauth_chat` — revoca el chat actual.
+- `/soul_auth_user <id>` — autoriza un usuario.
+- `/soul_unauth_user <id>` — revoca un usuario.
 
-## ⚠️ Disclaimer
+### Historial y privacidad
 
-Usar una cuenta de usuario de Telegram para automatizar respuestas es responsabilidad del usuario. Respeta los Términos de Servicio de Telegram y las reglas de los chats donde uses Soul Bot.
+- `/soul_exclude <chat_id>` — excluye un chat del escaneo.
+- `/soul_unexclude <chat_id>` — elimina la exclusión.
+- `/soul_excluded` — muestra exclusiones.
+- `/soul_delete <chat_id>` — borra tus mensajes de un chat en la base local.
+- `/soul_delete --confirm` — borra todos tus mensajes locales.
+- `/soul_delete_analyzed` — borra mensajes tuyos ya incorporados al perfil.
+- `/soul_delete_unanalyzed` — borra mensajes tuyos pendientes de análisis.
 
----
+Borrar mensajes de la base no modifica automáticamente `Soul.md`; si quieres eliminar aprendizajes, regenera el archivo después de limpiar los datos.
 
-<div align="center">
+## Estructura
 
-**Hecho con ❤️ y Python**
+```text
+soul-agent/
+├── soul_agent.py       # Cliente Telegram, handlers y ciclo principal
+├── ai_client.py        # Cliente async OpenAI-compatible + visión
+├── soul_manager.py     # Soul.md y memoria contextual por chat
+├── responder.py        # Decisión, contexto y generación de respuestas
+├── message_store.py    # SQLite WAL: mensajes y chat_context
+├── auth_manager.py     # Autorizaciones persistentes
+├── backfill.py         # Escaneo/deduplicación de historial
+├── progress.py         # Progreso de consola y Telegram
+├── config.example.json # Configuración de ejemplo
+├── requirements.txt    # Dependencias
+├── Soul.md             # Generado localmente, no se versiona
+├── data/               # SQLite local, no se versiona
+├── session/            # Sesión Telegram, no se versiona
+└── logs/               # Logs, no se versiona
+```
 
-[![Python](https://img.shields.io/badge/Python-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
-[![Telegram](https://img.shields.io/badge/Telegram-26A5E4?style=flat-square&logo=telegram&logoColor=white)](https://telegram.org)
-[![DeepSeek](https://img.shields.io/badge/DeepSeek-000000?style=flat-square&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTEyIDJMMyAxMHYxMGgxOFYxMEwxMiAyeiIgZmlsbD0id2hpdGUiLz48L3N2Zz4=&logoColor=white)](https://deepseek.com)
-[![SQLite](https://img.shields.io/badge/SQLite-003B57?style=flat-square&logo=sqlite&logoColor=white)](https://sqlite.org)
+## Seguridad y privacidad
 
-</div>
+- `config.json`, `data/`, `session/`, `logs/` y `Soul.md` están ignorados por Git.
+- Solo los mensajes necesarios para análisis/respuesta salen hacia el endpoint de IA.
+- La memoria contextual evita enviar el historial completo: usa una ventana acotada y un resumen local.
+- No guardes contraseñas, tokens o datos bancarios en mensajes que vayan a analizarse.
+- Revisa y rota las credenciales si alguna vez compartes el directorio o el archivo ZIP.
+- Usa exclusiones para chats sensibles antes de ejecutar un escaneo global.
+
+## Desarrollo y verificación
+
+Comprobar sintaxis sin iniciar Telegram:
+
+```bash
+python -m py_compile *.py
+python -m json.tool config.example.json >/dev/null
+```
+
+Inspeccionar cambios:
+
+```bash
+git status
+git diff --stat
+git diff
+```
+
+## Limitaciones conocidas
+
+- La calidad del clon depende de la cantidad y variedad de mensajes propios.
+- El resumen por chat es aproximado y puede fallar si el proveedor de IA devuelve JSON inválido; en ese caso se conserva el resumen anterior.
+- La respuesta puede tardar más cuando un chat necesita su primer resumen contextual.
+- El contexto persistente se actualiza por ventanas y no reemplaza la lectura de los mensajes recientes.
+- El escaneo de muchos chats puede tardar y consumir cuota de Telegram/IA.
+
+## Licencia
+
+MIT. Consulta `LICENSE`.

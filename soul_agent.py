@@ -601,6 +601,17 @@ class SoulAgent:
             f"Ejecuta /soul_now para que la IA regenere el Soul.md con estos datos.",
             quote=True
         )
+        # Actualizar memoria contextual de los chats principales sin bloquear el
+        # resultado del escaneo. Los demás chats se resumen bajo demanda.
+        asyncio.create_task(self._refresh_contexts_after_scan())
+
+    async def _refresh_contexts_after_scan(self) -> None:
+        try:
+            limit = int(self.cfg.get("scan", {}).get("context_refresh_limit", 50))
+            updated = await self.soul.refresh_contexts_for_top_chats(limit=limit)
+            log.info("Context memory refreshed after scan: %d chats", updated)
+        except Exception as e:
+            log.warning("Post-scan context refresh failed: %s", e)
 
     # -------------------------------------------------------------- exclusiones
     async def _handle_exclude(self, message: Message, args: str, add: bool) -> None:

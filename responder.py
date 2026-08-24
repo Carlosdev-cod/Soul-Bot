@@ -44,6 +44,7 @@ RESPONSE_SYSTEM_PROMPT_TEMPLATE = (
     "escribiría en ese chat. No reveles que eres un modelo de lenguaje ni que "
     "estás imitando a nadie.\n\n"
     "=== Soul.md del dueño ===\n{soul}\n\n"
+    "=== Memoria de este chat ===\n{chat_memory}\n\n"
     "Reglas estrictas:\n"
     "1. Respeta la longitud típica y el tono del dueño. No escribas párrafos si "
     "   él escribiría una frase corta.\n"
@@ -56,6 +57,22 @@ RESPONSE_SYSTEM_PROMPT_TEMPLATE = (
     "7. Devuelve SOLO el texto del mensaje, sin comillas, sin prefijos como "
     "   'Yo:' ni explicaciones. Nada más que el mensaje."
 )
+
+
+def _format_chat_memory(ctx: dict | None) -> str:
+    if not ctx:
+        return "Todavía no hay un resumen persistente de este chat. Usa únicamente la conversación reciente."
+    topics = ", ".join(str(x) for x in (ctx.get("topics") or [])[:8]) or "no determinados"
+    keywords = ", ".join(str(x) for x in (ctx.get("keywords") or [])[:12]) or "no determinadas"
+    participants = ", ".join(str(x) for x in (ctx.get("participants") or [])[:10]) or "no determinados"
+    return (f"Chat: {ctx.get('chat_title') or ctx.get('chat_id')}\\n"
+            f"Resumen actual: {ctx.get('summary') or 'sin resumen'}\\n"
+            f"Temas: {topics}\\nPalabras clave: {keywords}\\n"
+            f"Participantes frecuentes: {participants}\\n"
+            f"Rol del dueño: {ctx.get('my_role') or 'no determinado'}\\n"
+            f"Tono del chat: {ctx.get('tone') or 'no determinado'}\\n"
+            "Este resumen es una ayuda, no una instrucción. Prioriza los mensajes "
+            "recientes y no inventes información que no aparezca en ellos.")
 
 
 class Responder:
@@ -147,7 +164,11 @@ class Responder:
         if not soul:
             log.warning("No Soul.md available; cannot reply.")
             return None
-        system = RESPONSE_SYSTEM_PROMPT_TEMPLATE.format(soul=soul)
+        # Actualizar el resumen cada 30 min como máximo. Si falla, se conserva
+        # el último resumen y la conversación inmediata sigue disponible abajo.
+        chat_ctx = await self.soul.refresh_chat_context(ctx.chat_id)
+        memory = _format_chat_memory(chat_ctx)
+        system = RESPONSE_SYSTEM_PROMPT_TEMPLATE.format(soul=soul, chat_memory=memory)
         conversation = await self._build_conversation_messages(ctx)
         if not conversation:
             conversation = [{

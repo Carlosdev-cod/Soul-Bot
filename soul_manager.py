@@ -431,6 +431,94 @@ class SoulManager:
             log.warning("Learning summary generation failed: %s", e)
             return ""
 
+    async def refresh_chat_context(self, chat_id: int, *, force: bool = False,
+                                   max_messages: int = 80) -> dict | None:
+        """Resume el contexto reciente de un chat y lo guarda en SQLite.
+
+        Se usa una ventana acotada para que cada respuesta conozca el tema actual
+        sin reenviar todo el historial del chat al proveedor de IA.
+        """
+        current = await self.store.get_chat_context(chat_id)
+        now = int(time.time())
+        # No regenerar el resumen en cada mensaje: el historial reciente sigue
+        # entrando directamente en Responder y el resumen se refresca cada 30 min.
+        if current and not force and current.get("summary_at") and now - int(current["summary_at"]) < 1800:
+            return current
+        rows = await self.store.fetch_recent(chat_id, limit=max_messages)
+        if not rows:
+            return current
+        lines = []
+        participants = {}
+        for m in rows:
+            name = (m.get("from_name") or "alguien").strip()
+            participants[name] = participants.get(name, 0) + 1
+            body = (m.get("text") or m.get("caption") or "").strip()
+            if not body:
+                body = f"[{m.get('media_kind') or 'media'}]"
+            ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(m.get("ts") or now))
+            role = "YO" if m.get("is_out") else name
+            lines.append(f"[{ts}] {role}: {body[:500]}")
+        transcript = "\\n".join(lines)
+        prompt = f"""Analiza el contexto de esta conversación de Telegram.
+Devuelve SOLO JSON válido, sin markdown, con estas claves:
+summary (resumen concreto de 3-6 frases sobre lo que se está hablando ahora),
+topics (lista de hasta 8 temas), keywords (lista de hasta 12 palabras clave),
+my_role (rol del dueño en este chat: amigo, soporte, ventas, técnico, etc.),
+tone (tono dominante).
+No inventes datos. Distingue hechos de bromas y no incluyas secretos, contraseñas,
+tokens ni URLs completas.
+
+Conversación reciente:
+{transcript}"""
+        try:
+            raw = await self.ai.chat_text(
+                "Eres un analista de contexto conversacional preciso y conservador.",
+                prompt, temperature=0.2, max_tokens=700,
+            )
+            data = _parse_context_json(raw)
+            if not data.get("summary"):
+                return current
+            first_ts = min((m.get("ts") for m in rows if m.get("ts")), default=None)
+            last_ts = max((m.get("ts") for m in rows if m.get("ts")), default=None)
+            await self.store.upsert_chat_context(
+                chat_id,
+                chat_type=rows[-1].get("chat_type"),
+                chat_title=rows[-1].get("chat_title"),
+                participants=sorted(participants, key=participants.get, reverse=True)[:20],
+                topics=data.get("topics", [])[:8],
+                keywords=data.get("keywords", [])[:12],
+                summary=str(data["summary"])[:2500],
+                my_role=str(data.get("my_role", ""))[:120],
+                tone=str(data.get("tone", ""))[:120],
+                messages_total=len(rows),
+                my_messages_total=sum(1 for m in rows if m.get("is_out")),
+                first_ts=first_ts,
+                last_ts=last_ts,
+                summary_at=now,
+                summary_model=getattr(self.ai, "chat_model", ""),
+            )
+            return await self.store.get_chat_context(chat_id)
+        except Exception as e:
+            log.warning("Chat context refresh failed for %s: %s", chat_id, e)
+            return current
+
+    async def refresh_contexts_for_top_chats(self, limit: int = 50) -> int:
+        """Actualiza contexto de los chats con más mensajes propios.
+
+        Se limita deliberadamente para controlar coste/latencia del proveedor IA.
+        Los demás chats se actualizarán bajo demanda cuando llegue un mensaje.
+        """
+        chats = await self.store.top_chats(limit=max(1, int(limit)))
+        updated = 0
+        for chat in chats:
+            try:
+                ctx = await self.refresh_chat_context(int(chat["chat_id"]), force=True)
+                if ctx and ctx.get("summary"):
+                    updated += 1
+            except Exception as e:
+                log.warning("Context batch failed for %s: %s", chat.get("chat_id"), e)
+        return updated
+
     def last_learning_summary(self) -> str:
         return self._last_learning_summary
 
@@ -456,6 +544,27 @@ def _strip_codefence(text: str) -> str:
         if t.endswith("```"):
             t = t[:-3]
     return t.strip()
+
+
+def _parse_context_json(raw: str) -> dict:
+    """Parsea JSON aunque el proveedor lo envuelva accidentalmente en fences."""
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1]
+        if text.endswith("```"):
+            text = text[:-3]
+    try:
+        data = json.loads(text.strip())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return {}
+        try:
+            data = json.loads(match.group(0))
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
 
 
 def _count_chat_types(msgs: list[dict]) -> dict:

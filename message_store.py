@@ -82,6 +82,29 @@ class MessageStore:
                 key TEXT PRIMARY KEY,
                 value TEXT
             );
+            -- Memoria contextual por chat: qué se habla, con quién, qué temas.
+            -- Permite al agente responder con conocimiento del contexto del chat
+            -- actual, no solo de la personalidad global del dueño.
+            CREATE TABLE IF NOT EXISTS chat_context (
+                chat_id INTEGER PRIMARY KEY,
+                chat_type TEXT,
+                chat_title TEXT,
+                participants TEXT,           -- JSON: lista de nombres/ids frecuentes
+                topics TEXT,                 -- JSON: lista corta de temas recurrentes
+                keywords TEXT,               -- JSON: palabras clave más usadas
+                summary TEXT,                -- resumen en prosa (es) generado por IA
+                my_role TEXT,                -- cómo actúa el dueño en ese chat (ej: soporte, broma, ventas)
+                tone TEXT,                   -- tono dominante del chat (formal/informal/técnico/etc.)
+                messages_total INTEGER DEFAULT 0,    -- total de mensajes capturados del chat
+                my_messages_total INTEGER DEFAULT 0, -- mensajes del dueño en este chat
+                first_ts INTEGER,
+                last_ts INTEGER,
+                summary_at INTEGER,          -- epoch del último resumen generado
+                summary_model TEXT,          -- modelo usado
+                summary_version INTEGER DEFAULT 1
+            );
+            CREATE INDEX IF NOT EXISTS idx_ctx_last ON chat_context(last_ts);
+            CREATE INDEX IF NOT EXISTS idx_ctx_summary_at ON chat_context(summary_at);
             """)
             c.commit()
 
@@ -290,6 +313,94 @@ class MessageStore:
             global _CURSOR_DESC
             _CURSOR_DESC = cur.description
             return cur.fetchall()
+
+    # -------------------------------------------------------------- chat_context
+    async def upsert_chat_context(self, chat_id: int, **fields) -> None:
+        """
+        Inserta o actualiza la fila de memoria contextual de un chat.
+        Acepta cualquier subconjunto de columnas. Hace UPSERT por chat_id.
+        """
+        if not fields:
+            return
+        # Sanitizar: serializar listas/dicts a JSON
+        json_cols = ("participants", "topics", "keywords")
+        for c in json_cols:
+            if c in fields and not isinstance(fields[c], str):
+                fields[c] = json.dumps(fields[c], ensure_ascii=False)
+        cols = list(fields.keys())
+        placeholders = ",".join("?" * len(cols))
+        # UPDATE clause: solo columnas que no sean chat_id
+        update_cols = [c for c in cols if c != "chat_id"]
+        update_clause = ",".join(f"{c}=excluded.{c}" for c in update_cols)
+        sql = (f"INSERT INTO chat_context(chat_id, {','.join(cols)}) "
+               f"VALUES(?, {placeholders}) "
+               f"ON CONFLICT(chat_id) DO UPDATE SET {update_clause}")
+        params = [int(chat_id)] + [fields[c] for c in cols]
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._exec_write, sql, params)
+
+    async def get_chat_context(self, chat_id: int) -> dict | None:
+        """Lee la memoria contextual de un chat. Devuelve None si no existe."""
+        sql = ("SELECT chat_id, chat_type, chat_title, participants, topics, "
+               "keywords, summary, my_role, tone, messages_total, "
+               "my_messages_total, first_ts, last_ts, summary_at, "
+               "summary_model, summary_version "
+               "FROM chat_context WHERE chat_id=?")
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            rows = await loop.run_in_executor(None, self._exec_read, sql, (chat_id,))
+        if not rows:
+            return None
+        row = rows[0]
+        desc = [d[0] for d in _CURSOR_DESC]
+        out = dict(zip(desc, row))
+        # Deserializar JSON donde corresponda
+        for jc in ("participants", "topics", "keywords"):
+            if out.get(jc):
+                try:
+                    out[jc] = json.loads(out[jc])
+                except Exception:
+                    pass
+        return out
+
+    async def get_all_chat_contexts(self, min_messages: int = 0) -> list[dict]:
+        """Lista todas las memorias contextuales (para Soul.md / status)."""
+        sql = ("SELECT chat_id, chat_type, chat_title, summary, my_role, tone, "
+               "topics, keywords, my_messages_total, summary_at "
+               "FROM chat_context WHERE my_messages_total >= ? "
+               "ORDER BY last_ts DESC")
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            rows = await loop.run_in_executor(None, self._exec_read, sql, (min_messages,))
+        if not rows:
+            return []
+        desc = [d[0] for d in _CURSOR_DESC]
+        out = []
+        for r in rows:
+            d = dict(zip(desc, r))
+            for jc in ("topics", "keywords"):
+                if d.get(jc):
+                    try:
+                        d[jc] = json.loads(d[jc])
+                    except Exception:
+                        pass
+            out.append(d)
+        return out
+
+    async def count_chats_with_context(self) -> int:
+        sql = "SELECT COUNT(*) FROM chat_context WHERE summary IS NOT NULL AND summary != ''"
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            rows = await loop.run_in_executor(None, self._exec_read, sql, ())
+        return rows[0][0] if rows else 0
+
+    async def delete_chat_context(self, chat_id: int) -> bool:
+        sql = "DELETE FROM chat_context WHERE chat_id=?"
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            cur = await loop.run_in_executor(None, self._exec_write, sql, [chat_id])
+            return cur.rowcount > 0
 
 
 _CURSOR_DESC: list = []

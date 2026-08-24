@@ -53,6 +53,7 @@
     "scan_private": true,
     "scan_channels": false,
     "skip_empty_chats": true,
-    "report_progress_to_telegram": true
+    "report_progress_to_telegram": true,
+    "context_refresh_limit": 50
   }
 }
