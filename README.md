@@ -1,6 +1,38 @@
+<div align="center">
+
 # 🧬 Soul Bot
 
-Agente de Telegram basado en una **cuenta de usuario** que aprende el estilo de escritura del dueño y puede responder en chats autorizados con su personalidad, su tono y el contexto real de cada conversación.
+### Tu clon de Telegram con personalidad propia
+
+**Un agente de IA que aprende tu forma de escribir y responde como tú en Telegram.**
+
+[![Python](https://img.shields.io/badge/Python-3.12-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![DeepSeek](https://img.shields.io/badge/DeepSeek-Chat-000000?style=for-the-badge&logo=deepseek&logoColor=white)](https://deepseek.com)
+[![Gemini](https://img.shields.io/badge/Gemini-Flash-4285F4?style=for-the-badge&logo=google&logoColor=white)](https://gemini.google.com)
+[![Kurigram](https://img.shields.io/badge/Kurigram-2.2-0088CC?style=for-the-badge&logo=telegram&logoColor=white)](https://docs.pyrogram.org)
+[![SQLite](https://img.shields.io/badge/SQLite-WAL-003B57?style=for-the-badge&logo=sqlite&logoColor=white)](https://sqlite.org/)
+[![HTTPX](https://img.shields.io/badge/HTTPX-Async-5A29E4?style=for-the-badge&logo=python&logoColor=white)](https://www.python-httpx.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](LICENSE)
+[![Open Source](https://img.shields.io/badge/Open%20Source-❤️-green?style=for-the-badge)](LICENSE)
+
+---
+
+![Soul Bot Architecture](https://img.shields.io/badge/Architecture-Python%20%2B%20SQLite%20%2B%20Telegram%20API-blue?style=for-the-badge&logo=architecture&logoColor=white)
+
+### Stack tecnológico
+
+| Tecnología | Uso en Soul Bot |
+|---|---|
+| 🐍 **Python 3.10+** | Orquestación del agente y módulos asíncronos |
+| ✈️ **Kurigram / Pyrogram API** | Conexión con Telegram mediante cuenta de usuario |
+| 🧠 **DeepSeek / Gemini / OpenAI-compatible** | Personalidad, contexto, respuestas y visión |
+| 🗄️ **SQLite + WAL** | Mensajes, historial y memoria contextual por chat |
+| ⚡ **HTTPX async** | Cliente HTTP para el endpoint de IA |
+| 🔐 **Telegram Auth** | Autorización de grupos y usuarios |
+| 📊 **Markdown / JSON** | Soul.md, configuración y perfiles legibles |
+
+</div>
+
 
 > ⚠️ Automatizar una cuenta de usuario puede incumplir reglas de Telegram. Úsalo bajo tu responsabilidad, con autorización de los participantes y respetando la privacidad.
 
