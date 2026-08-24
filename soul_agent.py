@@ -419,9 +419,7 @@ class SoulAgent:
                     else f"ℹ️ El grupo '{chat.title}' (id={chat.id}) ya estaba autorizado."
                 )
             elif ctype == "private":
-                target = message.from_user.id
-                if message.reply_to_message and message.reply_to_message.from_user:
-                    target = message.reply_to_message.from_user.id
+                target = message.chat.id
                 added = self.auth.authorize_user(target)
                 await reply(
                     f"✅ Usuario {target} autorizado para auto-respuesta en privado." if added
@@ -439,9 +437,7 @@ class SoulAgent:
                     else f"ℹ️ El grupo '{chat.title}' no estaba autorizado."
                 )
             elif ctype == "private":
-                target = message.from_user.id
-                if message.reply_to_message and message.reply_to_message.from_user:
-                    target = message.reply_to_message.from_user.id
+                target = message.chat.id
                 removed = self.auth.revoke_user(target)
                 await reply(
                     f"✅ Usuario {target} desautorizado." if removed
