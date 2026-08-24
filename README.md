@@ -197,9 +197,11 @@ Configuración relevante:
 
 ### Modelos de IA
 
-- `/models` — consulta `GET /models` del endpoint configurado y muestra sus IDs en botones inline.
-- Al seleccionar un modelo, queda guardado como `ai.selected_model` en `config.json` y se usa para chat y visión sin reiniciar.
-- El botón **Config.json** elimina la selección manual y vuelve a `ai.chat_model`/`ai.vision_model` definidos en el archivo.
+- `/models` — consulta `GET /models` del endpoint configurado y muestra sus IDs.
+- `/models <model_id>` — valida y activa directamente un modelo, por ejemplo `/models gemini-3.6-flash`.
+- `/models config` — elimina la selección manual y vuelve al modelo por defecto del archivo.
+- El modelo seleccionado queda guardado como `ai.selected_model` en `config.json` y se usa para chat y visión sin reiniciar.
+- Para volver al valor de `config.json`, elimina `ai.selected_model` o usa el modelo definido en `ai.chat_model`.
 
 ### Autorización
 

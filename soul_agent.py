@@ -48,7 +48,7 @@ from typing import Any, Optional
 
 import httpx
 from pyrogram import Client, filters
-from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, User
+from pyrogram.types import Message, User
 from pyrogram.enums import ChatType
 
 from ai_client import AIClient, AIError
@@ -204,15 +204,6 @@ class SoulAgent:
         @app.on_edited_message(filters.outgoing)
         async def _on_edit_outgoing(client: Client, message: Message):
             await self._capture_message(message, is_out=True, is_edit=True)
-
-        @app.on_callback_query()
-        async def _on_model_callback(client: Client, callback: CallbackQuery):
-            if not callback.data or not callback.data.startswith("models:"):
-                return
-            if not callback.from_user or not self.auth.is_owner(callback.from_user.id):
-                await callback.answer("Solo el dueño puede cambiar el modelo.", show_alert=True)
-                return
-            await self._handle_model_callback(callback)
 
         log.info("Handlers registered.")
 
@@ -527,7 +518,7 @@ class SoulAgent:
             await self._handle_delete_unanalyzed(message)
 
     async def _handle_models_command(self, message: Message) -> None:
-        """Muestra los modelos disponibles y permite activar uno con botones."""
+        """Lista modelos o activa uno con `/models <model_id>`."""
         try:
             models = await self.ai.list_models()
         except AIError as e:
@@ -536,73 +527,51 @@ class SoulAgent:
         if not models:
             await message.reply("⚠️ El endpoint no publicó modelos disponibles.", quote=True)
             return
-        await message.reply(
-            self._models_text(models),
-            quote=True,
-            reply_markup=self._models_keyboard(models),
-        )
-
-    def _models_text(self, models: list[str]) -> str:
-        configured = self.cfg.get("ai", {}).get("chat_model", "")
+        args = (message.text or "").split(maxsplit=1)
+        requested = args[1].strip() if len(args) == 2 else ""
+        configured = self.cfg.get("ai", {}).get("chat_model", "gemini-3.6-flash")
         override = self.cfg.get("ai", {}).get("selected_model")
         active = override or configured
-        source = "seleccionado por /models" if override else "config.json (por defecto)"
-        return (
+
+        if requested:
+            if requested.lower() in ("config", "default", "json"):
+                self.cfg.setdefault("ai", {}).pop("selected_model", None)
+                active = configured
+                self.ai.set_model(active)
+                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                    json.dump(self.cfg, f, indent=2, ensure_ascii=False)
+                source = "config.json (por defecto)"
+                prefix = f"✅ Volviendo al modelo de config.json: `{active}`.\n\n"
+            else:
+                if requested not in models:
+                    await message.reply(
+                        f"❌ Modelo no disponible: `{requested}`\n\n" +
+                        "Usa exactamente uno de los IDs listados abajo.", quote=True
+                    )
+                    return
+                self.cfg.setdefault("ai", {})["selected_model"] = requested
+                self.ai.set_model(requested)
+                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                    json.dump(self.cfg, f, indent=2, ensure_ascii=False)
+                active = requested
+                source = "seleccionado por /models"
+                prefix = f"✅ Modelo cambiado a `{requested}`.\n\n"
+        else:
+            source = "config.json (por defecto)" if not override else "seleccionado por /models"
+            prefix = ""
+
+        model_lines = "\n".join(
+            f"{'✅ ' if model == active else '• '}`{model}`" for model in models
+        )
+        await message.reply(
+            prefix +
             "🤖 **Modelos disponibles en la API**\n\n"
             f"Activo: `{active}`\n"
             f"Origen: {source}\n\n"
-            "Pulsa un botón para usarlo en chat y visión.\n"
-            "‘Config.json’ quita la selección manual y vuelve al modelo definido en `config.json`."
+            "Para seleccionar uno, escribe:\n"
+            "`/models <model_id>`\n\n" + model_lines,
+            quote=True,
         )
-
-    def _models_keyboard(self, models: list[str]) -> InlineKeyboardMarkup:
-        buttons = [[InlineKeyboardButton(
-            "✅ Config.json (usar valor por defecto)",
-            callback_data="models:default",
-        )]]
-        override = self.cfg.get("ai", {}).get("selected_model")
-        configured = self.cfg.get("ai", {}).get("chat_model", "")
-        active = override or configured
-        for index in range(0, len(models), 2):
-            row = []
-            for model in models[index:index + 2]:
-                label = f"✅ {model}" if model == active else model
-                row.append(InlineKeyboardButton(label[:64], callback_data=f"models:set:{model}"))
-            buttons.append(row)
-        return InlineKeyboardMarkup(buttons)
-
-    async def _handle_model_callback(self, callback: CallbackQuery) -> None:
-        data = callback.data or ""
-        try:
-            models = await self.ai.list_models()
-            if data == "models:default":
-                self.cfg.get("ai", {}).pop("selected_model", None)
-                model = self.cfg.get("ai", {}).get("chat_model", "gemini-3.6-flash")
-                self.ai.set_model(model)
-                await callback.answer("Volviendo al modelo de config.json.")
-            elif data.startswith("models:set:"):
-                model = data.removeprefix("models:set:")
-                if model not in models:
-                    await callback.answer("Ese modelo ya no está disponible.", show_alert=True)
-                    return
-                self.cfg.setdefault("ai", {})["selected_model"] = model
-                self.ai.set_model(model)
-                await callback.answer(f"Modelo activo: {model}")
-            else:
-                await callback.answer()
-                return
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.cfg, f, indent=2, ensure_ascii=False)
-            if callback.message:
-                await callback.message.edit_text(
-                    self._models_text(models),
-                    reply_markup=self._models_keyboard(models),
-                )
-        except AIError as e:
-            await callback.answer(f"Error consultando modelos: {e}", show_alert=True)
-        except Exception as e:
-            log.exception("Model selection failed: %s", e)
-            await callback.answer("No se pudo aplicar el modelo.", show_alert=True)
 
     # -------------------------------------------------------------- scan
     async def _handle_scan(self, client: Client, message: Message,
