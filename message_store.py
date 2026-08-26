@@ -13,7 +13,7 @@ Esquema:
     chat_id INTEGER NOT NULL,
     chat_type TEXT,                           -- 'private' | 'group' | 'supergroup' | 'channel'
     chat_title TEXT,
-    message_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,              -- único POR CHAT (no global)
     from_id INTEGER NOT NULL,                  -- 0 si desconocido
     from_name TEXT,
     is_out INTEGER NOT NULL,                   -- 1 si fue enviado por el dueño
@@ -24,7 +24,8 @@ Esquema:
     reply_to_message_id INTEGER,
     reply_to_text TEXT,
     analyzed_for_soul INTEGER DEFAULT 0,      -- 1 si ya fue incorporado a Soul.md
-    raw TEXT                                   -- JSON de metadatos extra
+    raw TEXT,                                  -- JSON de metadatos extra
+    UNIQUE(chat_id, message_id)                -- dedup real: captura y edits no duplican
   )
 """
 from __future__ import annotations
@@ -107,6 +108,34 @@ class MessageStore:
             CREATE INDEX IF NOT EXISTS idx_ctx_summary_at ON chat_context(summary_at);
             """)
             c.commit()
+        self._migrate_unique_messages()
+
+    def _migrate_unique_messages(self) -> None:
+        """Crea el índice UNIQUE(chat_id, message_id).
+
+        En bases creadas por versiones anteriores pueden existir duplicados
+        (p. ej. mensajes editados re-insertados); se conserva la fila más
+        reciente (mayor id) antes de crear el índice.
+        """
+        with self._connect() as c:
+            try:
+                c.execute("CREATE UNIQUE INDEX IF NOT EXISTS "
+                          "idx_chat_message ON messages(chat_id, message_id)")
+                c.commit()
+            except sqlite3.IntegrityError:
+                log.warning("Duplicados detectados en messages; deduplicando "
+                            "(se conserva la versión más reciente)…")
+                c.execute("""
+                    DELETE FROM messages WHERE id NOT IN (
+                        SELECT MAX(id) FROM messages
+                        GROUP BY chat_id, message_id
+                    )
+                """)
+                c.commit()
+                c.execute("CREATE UNIQUE INDEX IF NOT EXISTS "
+                          "idx_chat_message ON messages(chat_id, message_id)")
+                c.commit()
+                log.info("Deduplicación completada e índice UNIQUE creado.")
 
     # -------------------------------------------------------------- meta
     def get_meta(self, key: str, default: Any = None) -> Any:
@@ -129,6 +158,12 @@ class MessageStore:
 
     # -------------------------------------------------------------- write
     async def add_message(self, **fields) -> int:
+        """Inserta o actualiza un mensaje (UPSERT por chat_id + message_id).
+
+        Si el mensaje ya existía (p. ej. llegó una edición), se actualiza su
+        contenido en la misma fila en lugar de duplicarla. El estado
+        analyzed_for_soul se conserva.
+        """
         cols = (
             "ts", "chat_id", "chat_type", "chat_title", "message_id",
             "from_id", "from_name", "is_out", "text", "has_media",
@@ -143,7 +178,12 @@ class MessageStore:
             fields["raw"] = json.dumps(fields["raw"], ensure_ascii=False)
         values = [fields.get(c) for c in cols]
         placeholders = ",".join("?" * len(cols))
-        sql = f"INSERT INTO messages({','.join(cols)}) VALUES({placeholders})"
+        # En conflicto, actualizar contenido pero conservar analyzed_for_soul
+        update_cols = [c for c in cols if c not in ("chat_id", "message_id",
+                                                    "analyzed_for_soul")]
+        update_clause = ",".join(f"{c}=excluded.{c}" for c in update_cols)
+        sql = (f"INSERT INTO messages({','.join(cols)}) VALUES({placeholders}) "
+               f"ON CONFLICT(chat_id, message_id) DO UPDATE SET {update_clause}")
         async with self._lock:
             loop = asyncio.get_running_loop()
             cur = await loop.run_in_executor(None, self._exec_write, sql, values)
@@ -162,13 +202,15 @@ class MessageStore:
     async def fetch_recent(self, chat_id: int, limit: int = 25) -> list[dict]:
         sql = ("SELECT ts, chat_id, chat_type, chat_title, message_id, from_id, "
                "from_name, is_out, text, has_media, media_kind, caption, "
-               "reply_to_message_id, reply_to_text "
-               "FROM messages WHERE chat_id=? ORDER BY ts DESC LIMIT ?")
+               "reply_to_message_id, reply_to_text, analyzed_for_soul "
+               "FROM messages WHERE chat_id=? ORDER BY ts DESC, id DESC LIMIT ?")
         async with self._lock:
             loop = asyncio.get_running_loop()
-            rows = await loop.run_in_executor(None, self._exec_read, sql, (chat_id, limit))
+            desc, rows = await loop.run_in_executor(None, self._exec_read,
+                                                    sql, (chat_id, limit))
         rows = list(reversed(rows))  # cronológico asc
-        return [dict(zip([d[0] for d in _CURSOR_DESC], r)) for r in rows]
+        names = [d[0] for d in desc]
+        return [dict(zip(names, r)) for r in rows]
 
     async def fetch_my_messages(self, limit: int = 2000,
                                 only_unanalyzed: bool = False) -> list[dict]:
@@ -181,21 +223,23 @@ class MessageStore:
                f"ORDER BY ts DESC LIMIT ?")
         async with self._lock:
             loop = asyncio.get_running_loop()
-            rows = await loop.run_in_executor(None, self._exec_read, sql, (limit,))
-        return [dict(zip([d[0] for d in _CURSOR_DESC], r)) for r in rows]
+            desc, rows = await loop.run_in_executor(None, self._exec_read,
+                                                    sql, (limit,))
+        names = [d[0] for d in desc]
+        return [dict(zip(names, r)) for r in rows]
 
     async def count_my_messages(self) -> int:
         sql = "SELECT COUNT(*) FROM messages WHERE is_out=1"
         async with self._lock:
             loop = asyncio.get_running_loop()
-            rows = await loop.run_in_executor(None, self._exec_read, sql, ())
+            _, rows = await loop.run_in_executor(None, self._exec_read, sql, ())
         return rows[0][0] if rows else 0
 
     async def count_unanalyzed(self) -> int:
         sql = "SELECT COUNT(*) FROM messages WHERE is_out=1 AND analyzed_for_soul=0"
         async with self._lock:
             loop = asyncio.get_running_loop()
-            rows = await loop.run_in_executor(None, self._exec_read, sql, ())
+            _, rows = await loop.run_in_executor(None, self._exec_read, sql, ())
         return rows[0][0] if rows else 0
 
     async def my_metrics(self) -> dict:
@@ -219,7 +263,7 @@ class MessageStore:
         """
         async with self._lock:
             loop = asyncio.get_running_loop()
-            rows = await loop.run_in_executor(None, self._exec_read, sql, ())
+            _, rows = await loop.run_in_executor(None, self._exec_read, sql, ())
         if not rows or not rows[0]:
             return {}
         r = rows[0]
@@ -246,7 +290,7 @@ class MessageStore:
         """
         async with self._lock:
             loop = asyncio.get_running_loop()
-            rows = await loop.run_in_executor(None, self._exec_read, sql, (limit,))
+            _, rows = await loop.run_in_executor(None, self._exec_read, sql, (limit,))
         return [{"chat_id": r[0], "chat_type": r[1], "chat_title": r[2], "count": r[3]}
                 for r in rows]
 
@@ -256,30 +300,51 @@ class MessageStore:
         return await self.fetch_my_messages(limit=limit,
                                              only_unanalyzed=only_unanalyzed)
 
-    async def mark_analyzed(self, message_ids: Iterable[int]) -> None:
-        ids = list(message_ids)
-        if not ids:
+    async def mark_analyzed(self, pairs: Iterable[tuple[int, int]]) -> None:
+        """Marca mensajes como analizados, identificados por (chat_id, message_id).
+
+        IMPORTANTE: message_id NO es único globalmente, solo dentro de cada
+        chat. Marcar por message_id a secas contamina mensajes de otros chats.
+        """
+        pairs = [(int(cid), int(mid)) for cid, mid in pairs]
+        if not pairs:
             return
-        placeholders = ",".join("?" * len(ids))
-        sql = f"UPDATE messages SET analyzed_for_soul=1 WHERE message_id IN ({placeholders}) " \
-              f"AND is_out=1"
         async with self._lock:
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self._exec_write, sql, ids)
+            await loop.run_in_executor(None, self._exec_mark_analyzed, pairs)
+
+    def _exec_mark_analyzed(self, pairs: list[tuple[int, int]]) -> None:
+        with self._connect() as c:
+            c.executemany(
+                "UPDATE messages SET analyzed_for_soul=1 "
+                "WHERE chat_id=? AND message_id=? AND is_out=1",
+                pairs,
+            )
+            c.commit()
+
+    async def message_exists(self, chat_id: int, message_id: int) -> bool:
+        """Comprueba si ya existe un mensaje (chat_id, message_id) en la BD."""
+        sql = ("SELECT 1 FROM messages WHERE chat_id=? AND message_id=? "
+               "LIMIT 1")
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            _, rows = await loop.run_in_executor(None, self._exec_read,
+                                                 sql, (chat_id, message_id))
+        return bool(rows)
 
     # -------------------------------------------------------------- delete
     async def count_owner_messages(self) -> int:
         sql = "SELECT COUNT(*) FROM messages WHERE is_out=1"
         async with self._lock:
             loop = asyncio.get_running_loop()
-            rows = await loop.run_in_executor(None, self._exec_read, sql, ())
+            _, rows = await loop.run_in_executor(None, self._exec_read, sql, ())
         return rows[0][0] if rows else 0
 
     async def count_analyzed(self) -> int:
         sql = "SELECT COUNT(*) FROM messages WHERE is_out=1 AND analyzed_for_soul=1"
         async with self._lock:
             loop = asyncio.get_running_loop()
-            rows = await loop.run_in_executor(None, self._exec_read, sql, ())
+            _, rows = await loop.run_in_executor(None, self._exec_read, sql, ())
         return rows[0][0] if rows else 0
 
     async def delete_owner_messages(self) -> int:
@@ -308,11 +373,14 @@ class MessageStore:
             return cur.rowcount
 
     def _exec_read(self, sql, params):
+        """Ejecuta una lectura y devuelve (descripción_columnas, filas).
+
+        La descripción viaja junto a las filas para evitar estado global
+        compartido entre consultas concurrentes.
+        """
         with self._connect() as c:
             cur = c.execute(sql, params)
-            global _CURSOR_DESC
-            _CURSOR_DESC = cur.description
-            return cur.fetchall()
+            return cur.description, cur.fetchall()
 
     # -------------------------------------------------------------- chat_context
     async def upsert_chat_context(self, chat_id: int, **fields) -> None:
@@ -349,12 +417,12 @@ class MessageStore:
                "FROM chat_context WHERE chat_id=?")
         async with self._lock:
             loop = asyncio.get_running_loop()
-            rows = await loop.run_in_executor(None, self._exec_read, sql, (chat_id,))
+            desc, rows = await loop.run_in_executor(None, self._exec_read,
+                                                    sql, (chat_id,))
         if not rows:
             return None
         row = rows[0]
-        desc = [d[0] for d in _CURSOR_DESC]
-        out = dict(zip(desc, row))
+        out = dict(zip([d[0] for d in desc], row))
         # Deserializar JSON donde corresponda
         for jc in ("participants", "topics", "keywords"):
             if out.get(jc):
@@ -372,13 +440,14 @@ class MessageStore:
                "ORDER BY last_ts DESC")
         async with self._lock:
             loop = asyncio.get_running_loop()
-            rows = await loop.run_in_executor(None, self._exec_read, sql, (min_messages,))
+            desc, rows = await loop.run_in_executor(None, self._exec_read,
+                                                    sql, (min_messages,))
         if not rows:
             return []
-        desc = [d[0] for d in _CURSOR_DESC]
+        names = [d[0] for d in desc]
         out = []
         for r in rows:
-            d = dict(zip(desc, r))
+            d = dict(zip(names, r))
             for jc in ("topics", "keywords"):
                 if d.get(jc):
                     try:
@@ -392,7 +461,7 @@ class MessageStore:
         sql = "SELECT COUNT(*) FROM chat_context WHERE summary IS NOT NULL AND summary != ''"
         async with self._lock:
             loop = asyncio.get_running_loop()
-            rows = await loop.run_in_executor(None, self._exec_read, sql, ())
+            _, rows = await loop.run_in_executor(None, self._exec_read, sql, ())
         return rows[0][0] if rows else 0
 
     async def delete_chat_context(self, chat_id: int) -> bool:
@@ -401,6 +470,3 @@ class MessageStore:
             loop = asyncio.get_running_loop()
             cur = await loop.run_in_executor(None, self._exec_write, sql, [chat_id])
             return cur.rowcount > 0
-
-
-_CURSOR_DESC: list = []

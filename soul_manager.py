@@ -334,7 +334,9 @@ class SoulManager:
             return AnalysisResult(ok=False, error=f"Soul.md inválido: {validation_error}")
         
         self._save_soul(text)
-        await self.store.mark_analyzed([m["message_id"] for m in msgs])
+        await self.store.mark_analyzed(
+            [(m["chat_id"], m["message_id"]) for m in msgs]
+        )
         self._initial_done = True
         self._last_refresh_at = time.time()
         log.info("Soul.md generated (%d bytes).", len(text))
@@ -393,7 +395,9 @@ class SoulManager:
                 return AnalysisResult(ok=False, error=str(e))
             text = _strip_codefence(text)
             self._save_soul(text)
-            await self.store.mark_analyzed([m["message_id"] for m in msgs])
+            await self.store.mark_analyzed(
+                [(m["chat_id"], m["message_id"]) for m in msgs]
+            )
             self._last_refresh_at = time.time()
             log.info("Soul.md refreshed (%d bytes).", len(text))
             learn = await self._gen_learning_summary(text, msgs, is_initial=False)
@@ -458,7 +462,7 @@ class SoulManager:
             ts = time.strftime("%Y-%m-%d %H:%M", time.localtime(m.get("ts") or now))
             role = "YO" if m.get("is_out") else name
             lines.append(f"[{ts}] {role}: {body[:500]}")
-        transcript = "\\n".join(lines)
+        transcript = "\n".join(lines)
         prompt = f"""Analiza el contexto de esta conversación de Telegram.
 Devuelve SOLO JSON válido, sin markdown, con estas claves:
 summary (resumen concreto de 3-6 frases sobre lo que se está hablando ahora),

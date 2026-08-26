@@ -120,7 +120,7 @@ class BackfillRunner:
                 if not message.from_user or message.from_user.id != self.owner_id:
                     continue
                 # Deduplicar por (chat_id, message_id)
-                if await self._exists(chat.id, message.id):
+                if await self.store.message_exists(chat.id, message.id):
                     already += 1
                     continue
                 await self._store_message(chat, message)
@@ -139,16 +139,6 @@ class BackfillRunner:
         except Exception as e:
             log.warning("Backfill failed in chat %s: %s", chat.id, e)
             stats.failed_chats += 1
-
-    async def _exists(self, chat_id: int, message_id: int) -> bool:
-        # Cheap check: si ya está en BD por chat_id + message_id
-        sql = ("SELECT 1 FROM messages WHERE chat_id=? AND message_id=? "
-               "AND is_out=1 LIMIT 1")
-        async with self.store._lock:
-            loop = asyncio.get_running_loop()
-            rows = await loop.run_in_executor(None, self.store._exec_read,
-                                              sql, (chat_id, message_id))
-        return bool(rows)
 
     async def _store_message(self, chat: Chat, message: Message) -> None:
         ctype = (chat.type.value if isinstance(chat.type, ChatType)

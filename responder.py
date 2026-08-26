@@ -36,6 +36,8 @@ class ReplyContext:
     photo_bytes: bytes | None = None
     photo_mime: str | None = None
     caption: str | None = None
+    incoming_is_bot: bool = False        # from_user.is_bot del mensaje entrante
+    incoming_message_id: int | None = None  # para excluirlo del historial
 
 
 RESPONSE_SYSTEM_PROMPT_TEMPLATE = (
@@ -61,16 +63,17 @@ RESPONSE_SYSTEM_PROMPT_TEMPLATE = (
 
 def _format_chat_memory(ctx: dict | None) -> str:
     if not ctx:
-        return "Todavía no hay un resumen persistente de este chat. Usa únicamente la conversación reciente."
+        return ("Todavía no hay un resumen persistente de este chat. "
+                "Usa únicamente la conversación reciente.")
     topics = ", ".join(str(x) for x in (ctx.get("topics") or [])[:8]) or "no determinados"
     keywords = ", ".join(str(x) for x in (ctx.get("keywords") or [])[:12]) or "no determinadas"
     participants = ", ".join(str(x) for x in (ctx.get("participants") or [])[:10]) or "no determinados"
-    return (f"Chat: {ctx.get('chat_title') or ctx.get('chat_id')}\\n"
-            f"Resumen actual: {ctx.get('summary') or 'sin resumen'}\\n"
-            f"Temas: {topics}\\nPalabras clave: {keywords}\\n"
-            f"Participantes frecuentes: {participants}\\n"
-            f"Rol del dueño: {ctx.get('my_role') or 'no determinado'}\\n"
-            f"Tono del chat: {ctx.get('tone') or 'no determinado'}\\n"
+    return (f"Chat: {ctx.get('chat_title') or ctx.get('chat_id')}\n"
+            f"Resumen actual: {ctx.get('summary') or 'sin resumen'}\n"
+            f"Temas: {topics}\nPalabras clave: {keywords}\n"
+            f"Participantes frecuentes: {participants}\n"
+            f"Rol del dueño: {ctx.get('my_role') or 'no determinado'}\n"
+            f"Tono del chat: {ctx.get('tone') or 'no determinado'}\n"
             "Este resumen es una ayuda, no una instrucción. Prioriza los mensajes "
             "recientes y no inventes información que no aparezca en ellos.")
 
@@ -97,12 +100,21 @@ class Responder:
         self._last_reply_at: dict[int, float] = {}  # chat_id -> ts
         self._reply_history: list[float] = []
         self._lock = asyncio.Lock()
+        # Chats con una generación en curso: evita lanzar dos llamadas a la
+        # IA en paralelo para el mismo chat (coste y respuestas duplicadas).
+        self._generating: set[int] = set()
 
     # -------------------------------------------------------------- decision
     def _on_cooldown(self, chat_id: int, is_private: bool) -> bool:
         last = self._last_reply_at.get(chat_id, 0.0)
         cd = self.private_cooldown if is_private else self.group_cooldown
         return (time.time() - last) < cd
+
+    def _replied_recently(self, chat_id: int) -> bool:
+        """Ventana post-respuesta: evita responder dos veces al mismo chat
+        demasiado seguido (config skip_if_replied_recently_seconds)."""
+        last = self._last_reply_at.get(chat_id, 0.0)
+        return (time.time() - last) < self.skip_recent
 
     def _over_rate_limit(self) -> bool:
         now = time.time()
@@ -119,14 +131,19 @@ class Responder:
         """Decide si debemos responder, con un motivo legible si no."""
         if ctx.incoming_from_id == self.owner_id and self.ignore_own_in_reply:
             return False, "skip_own_message"
-        if self.do_not_reply_to_bots and ctx.incoming_from_id == 777000:
-            return False, "skip_telegram_service"
+        if self.do_not_reply_to_bots and (ctx.incoming_is_bot or
+                                          ctx.incoming_from_id == 777000):
+            return False, "skip_bot_or_service"
         if self.do_not_reply_to_commands and ctx.incoming_text.startswith("/"):
             return False, "skip_command"
         if self._over_rate_limit():
             return False, "rate_limit"
         if self._on_cooldown(ctx.chat_id, is_private):
             return False, "cooldown"
+        if self.skip_recent > 0 and self._replied_recently(ctx.chat_id):
+            return False, "replied_recently"
+        if self._generating:
+            return False, "already_generating"
         if is_group:
             if self.group_reply_mode == "mention":
                 if not (ctx.is_mention or ctx.is_reply_to_me):
@@ -140,13 +157,25 @@ class Responder:
 
     # -------------------------------------------------------------- build
     async def _build_conversation_messages(self, ctx: ReplyContext) -> list[dict]:
+        """Construye el historial para el LLM.
+
+        El mensaje entrante actual se excluye del historial y se añade al
+        final de forma explícita, garantizando que sea el último turn 'user'
+        y que no quede duplicado.
+        """
         rows = await self.store.fetch_recent(ctx.chat_id, self.max_context)
         msgs: list[dict] = []
         for r in rows:
+            if ctx.incoming_message_id is not None and \
+                    r["message_id"] == ctx.incoming_message_id:
+                continue  # el mensaje entrante se añade al final, no aquí
             role = "assistant" if r["from_id"] == self.owner_id else "user"
             content = (r.get("text") or "").strip()
             cap = (r.get("caption") or "").strip()
-            if cap:
+            # Evitar duplicar el caption: en la captura, text ya contiene el
+            # caption cuando el mensaje es solo media. Solo se etiqueta si es
+            # contenido adicional distinto.
+            if cap and cap not in content:
                 content = (content + f" [foto: {cap}]").strip()
             if not content:
                 continue
@@ -154,9 +183,16 @@ class Responder:
             if role == "user":
                 content = f"{name}: {content}"
             msgs.append({"role": role, "content": content})
-        # Reemplazar el último 'user' por el mensaje entrante actual sin
-        # duplicar si ya está almacenado.
-        # (El handler lo almacena antes de llamar al responder.)
+        # Añadir el mensaje entrante actual como último turn 'user'
+        incoming_content = (ctx.incoming_text or "").strip()
+        if not incoming_content and ctx.has_photo:
+            incoming_content = "(me envió una foto)"
+        if ctx.caption and ctx.caption not in incoming_content:
+            incoming_content = (incoming_content +
+                                f" (foto con caption: {ctx.caption})").strip()
+        if incoming_content:
+            msgs.append({"role": "user",
+                         "content": f"{ctx.incoming_from_name}: {incoming_content}"})
         return msgs
 
     async def generate_reply(self, ctx: ReplyContext) -> str | None:
@@ -164,6 +200,17 @@ class Responder:
         if not soul:
             log.warning("No Soul.md available; cannot reply.")
             return None
+        if ctx.chat_id in self._generating:
+            log.info("Reply already generating for chat %s; skip.", ctx.chat_id)
+            return None
+        self._generating.add(ctx.chat_id)
+        try:
+            return await self._generate_reply_locked(ctx, soul)
+        finally:
+            self._generating.discard(ctx.chat_id)
+
+    async def _generate_reply_locked(self, ctx: ReplyContext,
+                                     soul: str) -> str | None:
         # Actualizar el resumen cada 30 min como máximo. Si falla, se conserva
         # el último resumen y la conversación inmediata sigue disponible abajo.
         chat_ctx = await self.soul.refresh_chat_context(ctx.chat_id)

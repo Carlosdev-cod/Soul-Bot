@@ -44,13 +44,12 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import Any, Optional
 
-import httpx
 from pyrogram import Client, filters
 from pyrogram.types import Message, User
 from pyrogram.enums import ChatType
 
+import config_store
 from ai_client import AIClient, AIError
 from auth_manager import AuthManager
 from backfill import BackfillRunner
@@ -89,8 +88,14 @@ def setup_logging(cfg: dict) -> None:
 #  Loader
 # =====================================================================
 def load_config() -> dict:
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        return config_store.read_config(CONFIG_PATH)
+    except FileNotFoundError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"❌ config.json tiene JSON inválido: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 # =====================================================================
@@ -111,6 +116,10 @@ class SoulAgent:
         )
         self.auto_reply_enabled = bool(cfg.get("responder", {}).get(
             "auto_reply_enabled", True))
+        # Privacidad: por defecto solo se guardan mensajes ENTRANTES de chats
+        # autorizados (los salientes del dueño siempre se guardan para Soul.md).
+        self.capture_incoming_authorized_only = bool(
+            cfg.get("capture", {}).get("only_authorized_incoming", True))
         self.paused = False
         self._refresh_task: asyncio.Task | None = None
         self._stop_event = asyncio.Event()
@@ -190,13 +199,15 @@ class SoulAgent:
         )
         async def _on_admin_cmd(client: Client, message: Message):
             text = (message.text or "").strip()
-            command = text.split(maxsplit=1)[0].lower() if text else ""
+            # Normalizar comando: soporta sufijos tipo /soul_status@otro_usuario
+            first = text.split(maxsplit=1)[0].lower() if text else ""
+            command = first.split("@")[0] if first else ""
             if command.startswith("/soul_") or command == "/models":
                 log.info("Admin command detected: %s", text)
                 await self._handle_admin_command(client, message)
                 return  # No procesar más handlers para este mensaje
             # Si no es comando, procesar normalmente
-            await self._capture_message(message, is_out=bool(message.outgoing))
+            await self._maybe_capture(message)
             if not message.outgoing:
                 await self._maybe_reply(client, message)
 
@@ -208,6 +219,29 @@ class SoulAgent:
         log.info("Handlers registered.")
 
     # -------------------------------------------------------------- capture
+    async def _maybe_capture(self, message: Message) -> None:
+        """Decide si un mensaje debe guardarse en la base local.
+
+        - Los mensajes SALIENTES del dueño siempre se guardan (corpus Soul.md).
+        - Los ENTRANTES solo se guardan si vienen de un chat autorizado
+          (config `capture.only_authorized_incoming`, por defecto true).
+          Esto evita acumular en SQLite conversaciones privadas ajenas que
+          el agente nunca va a usar.
+        """
+        is_out = bool(message.outgoing)
+        if not is_out and self.capture_incoming_authorized_only:
+            chat = message.chat
+            ctype = (chat.type.value if isinstance(chat.type, ChatType)
+                     else str(chat.type))
+            if ctype in ("group", "supergroup"):
+                if not self.auth.is_group_authorized(chat.id):
+                    return
+            elif ctype == "private":
+                uid = message.from_user.id if message.from_user else chat.id
+                if not self.auth.is_user_authorized(uid):
+                    return
+        await self._capture_message(message, is_out=is_out)
+
     async def _capture_message(self, message: Message, *, is_out: bool,
                                 is_edit: bool = False) -> None:
         try:
@@ -291,12 +325,8 @@ class SoulAgent:
         # Capturar foto si la hay (para visión)
         photo_bytes = None
         photo_mime = None
-        if message.photo and self.cfg.get("ai", {}).get("vision_enabled", True):
+        if message.photo and self.ai.vision_enabled:
             try:
-                # Tamaño 'small' es suficiente para describir
-                photo = message.photo
-                # Elegir el tamaño más grande disponible (último en la lista sizes)
-                target = photo.thumbs[-1] if getattr(photo, "thumbs", None) else photo
                 buf = await client.download_media(message, in_memory=True,
                                                    file_size_limit=2_000_000)
                 if buf is not None:
@@ -319,6 +349,8 @@ class SoulAgent:
             photo_bytes=photo_bytes,
             photo_mime=photo_mime,
             caption=(message.caption or "").strip(),
+            incoming_is_bot=bool(getattr(message.from_user, "is_bot", False)),
+            incoming_message_id=message.id,
         )
         ok, reason = self.responder.should_reply(ctx, is_group=is_group,
                                                     is_private=is_private)
@@ -354,7 +386,7 @@ class SoulAgent:
         # entities mention
         for ent in (message.entities or []):
             if ent.type and ent.type.value == "mention":
-                mentioned = text[ent.offset: ent.offset + ent.length]
+                mentioned = _utf16_slice(text, ent.offset or 0, ent.length or 0)
                 if me.username and mentioned.lstrip("@").lower() == me.username.lower():
                     return True
         return False
@@ -363,7 +395,8 @@ class SoulAgent:
     async def _handle_admin_command(self, client: Client, message: Message) -> None:
         if not message.from_user or not self.auth.is_owner(message.from_user.id):
             return
-        cmd = (message.text or "").split()[0].lstrip("/").lower()
+        raw_cmd = (message.text or "").split()[0] if (message.text or "").split() else ""
+        cmd = raw_cmd.lstrip("/").lower().split("@")[0]
         args = (message.text or "").split(maxsplit=1)[1] if " " in (message.text or "") else ""
 
         async def reply(text: str):
@@ -480,9 +513,8 @@ class SoulAgent:
                 await reply("Uso: /soul_set_mode mention|always")
                 return
             self.responder.set_group_mode(mode)
-            self.cfg["responder"]["group_reply_mode"] = mode
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.cfg, f, indent=2, ensure_ascii=False)
+            self._update_config(lambda cfg: cfg.setdefault(
+                "responder", {}).__setitem__("group_reply_mode", mode))
             await reply(f"✅ Modo de respuesta en grupos: {mode}")
         elif cmd == "soul_show":
             soul = self.soul.get_soul() or "(Soul.md aún no generado)"
@@ -529,33 +561,34 @@ class SoulAgent:
             return
         args = (message.text or "").split(maxsplit=1)
         requested = args[1].strip() if len(args) == 2 else ""
-        configured = self.cfg.get("ai", {}).get("chat_model", "gemini-3.6-flash")
+        configured = self.cfg.get("ai", {}).get("chat_model", "")
         override = self.cfg.get("ai", {}).get("selected_model")
         active = override or configured
 
         if requested:
             if requested.lower() in ("config", "default", "json"):
-                self.cfg.setdefault("ai", {}).pop("selected_model", None)
+                self._update_config(lambda cfg: cfg.setdefault(
+                    "ai", {}).pop("selected_model", None))
                 active = configured
                 self.ai.set_model(active)
-                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                    json.dump(self.cfg, f, indent=2, ensure_ascii=False)
                 source = "config.json (por defecto)"
                 prefix = f"✅ Volviendo al modelo de config.json: `{active}`.\n\n"
             else:
-                if requested not in models:
+                # Aceptar coincidencia exacta o insensible a mayúsculas
+                match = next((m for m in models if m == requested), None) or \
+                        next((m for m in models if m.lower() == requested.lower()), None)
+                if not match:
                     await message.reply(
                         f"❌ Modelo no disponible: `{requested}`\n\n" +
                         "Usa exactamente uno de los IDs listados abajo.", quote=True
                     )
                     return
-                self.cfg.setdefault("ai", {})["selected_model"] = requested
-                self.ai.set_model(requested)
-                with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                    json.dump(self.cfg, f, indent=2, ensure_ascii=False)
-                active = requested
+                self._update_config(lambda cfg: cfg.setdefault(
+                    "ai", {}).__setitem__("selected_model", match))
+                self.ai.set_model(match)
+                active = match
                 source = "seleccionado por /models"
-                prefix = f"✅ Modelo cambiado a `{requested}`.\n\n"
+                prefix = f"✅ Modelo cambiado a `{match}`.\n\n"
         else:
             source = "config.json (por defecto)" if not override else "seleccionado por /models"
             prefix = ""
@@ -572,6 +605,15 @@ class SoulAgent:
             "`/models <model_id>`\n\n" + model_lines,
             quote=True,
         )
+
+    # -------------------------------------------------------------- config
+    def _update_config(self, mutator) -> None:
+        """Modifica config.json de forma segura (read-modify-write atómico)
+        y refresca la copia en memoria del agente."""
+        try:
+            self.cfg = config_store.update_config(CONFIG_PATH, mutator)
+        except Exception as e:
+            log.error("No se pudo persistir config.json: %s", e)
 
     # -------------------------------------------------------------- scan
     async def _handle_scan(self, client: Client, message: Message,
@@ -598,6 +640,7 @@ class SoulAgent:
         
         # Parsear IDs: separados por comas o espacios
         only_chat_ids: list[int] = []
+        invalid_args: list[str] = []
         if cmd == "soul_scan" and args.strip():
             # Limpiar y separar por comas o espacios
             raw = args.strip().replace(" ", ",")
@@ -606,7 +649,16 @@ class SoulAgent:
                 clean = part.lstrip("-")
                 if clean.isdigit():
                     only_chat_ids.append(int(part))
-        
+                else:
+                    invalid_args.append(part)
+            if invalid_args:
+                muestra = ", ".join(invalid_args[:5])
+                await message.reply(
+                    f"⚠️ Ignoré {len(invalid_args)} argumento(s) no numérico(s): "
+                    f"{muestra}. Usa IDs numéricos, ej: /soul_scan -100123,456",
+                    quote=True
+                )
+
         if only_chat_ids:
             log.info("Scanning specific chats: %s", only_chat_ids)
         
@@ -703,13 +755,11 @@ class SoulAgent:
             excluded.discard(chat_id)
             action = "incluido"
         
-        # Guardar en config
-        if "scan" not in self.cfg:
-            self.cfg["scan"] = {}
-        self.cfg["scan"]["excluded_chat_ids"] = sorted(excluded)
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(self.cfg, f, indent=2, ensure_ascii=False)
-        
+        # Guardar en config (read-modify-write seguro)
+        def _mutate(cfg: dict) -> None:
+            cfg.setdefault("scan", {})["excluded_chat_ids"] = sorted(excluded)
+        self._update_config(_mutate)
+
         # Actualizar runner si existe
         await message.reply(f"✅ Chat {chat_id} {action} del escaneo.", quote=True)
 
@@ -910,6 +960,21 @@ class SoulAgent:
         return "\n".join(lines)
 
 
+def _utf16_slice(text: str, offset: int, length: int) -> str:
+    """Extrae el substring apuntado por una entidad de Telegram.
+
+    Telegram expresa offsets/lengths en unidades UTF-16, mientras que Python
+    indexa por code points: si hay emojis antes de la mención, un slice
+    directo devuelve texto desplazado. Se convierte explícitamente.
+    """
+    try:
+        raw = text.encode("utf-16-le")
+        chunk = raw[offset * 2:(offset + length) * 2]
+        return chunk.decode("utf-16-le")
+    except Exception:
+        return text[offset:offset + length]
+
+
 _HELP_TEXT = """🪪 **Soul Agent** — comandos del dueño
 
 📊 Estado y stats:
@@ -954,7 +1019,9 @@ _HELP_TEXT = """🪪 **Soul Agent** — comandos del dueño
 /soul_set_mode always — responder a una fracción de mensajes en grupos autorizados
 
 🤖 Modelo de IA:
-/models — consultar los modelos de la API y seleccionar uno con botones
+/models — listar los modelos disponibles de la API
+/models <model_id> — activar un modelo (ej: /models gemini-2.0-flash)
+/models config — volver al modelo por defecto de config.json
 
 /soul_help — esta ayuda
 """
