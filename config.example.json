@@ -56,5 +56,8 @@
     "skip_empty_chats": true,
     "report_progress_to_telegram": true,
     "context_refresh_limit": 50
+  },
+  "capture": {
+    "only_authorized_incoming": true
   }
 }

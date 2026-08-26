@@ -83,6 +83,10 @@ La tabla `chat_context` guarda una memoria resumida por `chat_id`:
 
 El resumen se actualiza como máximo cada 30 minutos por chat. La conversación reciente se consulta en cada respuesta, por lo que el agente puede reaccionar al tema actual aunque la memoria persistente todavía no se haya refrescado.
 
+### Privacidad de la captura
+
+Los mensajes **salientes del dueño** siempre se guardan (son el corpus de Soul.md). Los mensajes **entrantes** solo se guardan si provienen de un chat autorizado (`capture.only_authorized_incoming`, por defecto `true`). Así la base local no acumula conversaciones privadas ajenas que el agente no va a usar.
+
 Después de `/soul_scan`, se actualizan en segundo plano los chats principales —por defecto, los 50 con más mensajes tuyos—. Los demás se actualizan automáticamente cuando reciben una conversación autorizada.
 
 El resumen es una ayuda para el modelo, no una instrucción: los mensajes recientes tienen prioridad y el agente debe evitar inventar información.
@@ -175,7 +179,7 @@ Configuración relevante:
 }
 ```
 
-`backfill_limit_per_chat` limita cuántos mensajes se recorren por chat en cada escaneo. El escaneo es deduplicado por `chat_id + message_id`, así que repetir `/soul_scan` no debería duplicar tus mensajes.
+`backfill_limit_per_chat` limita cuántos mensajes se recorren por chat en cada escaneo. El escaneo y la captura en vivo están deduplicados por `chat_id + message_id` (índice UNIQUE en SQLite): repetir `/soul_scan` no duplica mensajes y editar un mensaje actualiza su fila en vez de crear una nueva. Al arrancar sobre una base antigua con duplicados, la migración limpia el exceso conservando la versión más reciente.
 
 ## Comandos
 
@@ -194,6 +198,8 @@ Configuración relevante:
 - `/soul_resume` — reanuda respuestas.
 - `/soul_set_mode mention` — responde si mencionan o responden al dueño.
 - `/soul_set_mode always` — responde aleatoriamente en grupos autorizados según `prob_reply_in_always_mode`.
+
+Tras responder en un chat, el agente espera `skip_if_replied_recently_seconds` (por defecto 30 s) antes de volver a responder en ese mismo chat, además del cooldown por tipo de chat.
 
 ### Modelos de IA
 
@@ -225,15 +231,17 @@ Borrar mensajes de la base no modifica automáticamente `Soul.md`; si quieres el
 ## Estructura
 
 ```text
-soul-agent/
+Soul-Bot/
 ├── soul_agent.py       # Cliente Telegram, handlers y ciclo principal
 ├── ai_client.py        # Cliente async OpenAI-compatible + visión
 ├── soul_manager.py     # Soul.md y memoria contextual por chat
 ├── responder.py        # Decisión, contexto y generación de respuestas
-├── message_store.py    # SQLite WAL: mensajes y chat_context
+├── message_store.py    # SQLite WAL: mensajes y chat_context (dedup real)
 ├── auth_manager.py     # Autorizaciones persistentes
+├── config_store.py     # Escritura atómica read-modify-write de config.json
 ├── backfill.py         # Escaneo/deduplicación de historial
 ├── progress.py         # Progreso de consola y Telegram
+├── tests/              # Suite pytest (sin necesidad de Telegram)
 ├── config.example.json # Configuración de ejemplo
 ├── requirements.txt    # Dependencias
 ├── Soul.md             # Generado localmente, no se versiona
@@ -258,6 +266,13 @@ Comprobar sintaxis sin iniciar Telegram:
 ```bash
 python -m py_compile *.py
 python -m json.tool config.example.json >/dev/null
+```
+
+Ejecutar la suite de tests (no necesita credenciales de Telegram):
+
+```bash
+pip install pytest pytest-asyncio
+pytest tests/ -v
 ```
 
 Inspeccionar cambios:
