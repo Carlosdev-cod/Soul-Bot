@@ -332,6 +332,38 @@ class MessageStore:
                                                  sql, (chat_id, message_id))
         return bool(rows)
 
+    async def search_messages(self, query: str, limit: int = 5,
+                              chat_id: int | None = None) -> list[dict]:
+        """Búsqueda de texto (LIKE) sobre el corpus capturado.
+
+        Escapa los comodines SQL del query para que '%' y '_' del usuario
+        no rompan la búsqueda. Prioriza el contenido textual (text/caption)
+        y devuelve resultados ordenados por reciencia.
+        """
+        query = (query or "").strip()
+        if not query:
+            return []
+        esc = (query.replace("\\", "\\\\").replace("%", "\\%")
+               .replace("_", "\\_"))
+        pattern = f"%{esc}%"
+        where = ("(text LIKE ? ESCAPE '\\' OR caption LIKE ? ESCAPE '\\')"
+                 " AND COALESCE(text,'') != ''")
+        params: list[Any] = [pattern, pattern]
+        if chat_id is not None:
+            where += " AND chat_id=?"
+            params.append(int(chat_id))
+        sql = (f"SELECT ts, chat_id, chat_type, chat_title, message_id, "
+               f"from_id, from_name, is_out, text, caption "
+               f"FROM messages WHERE {where} "
+               f"ORDER BY ts DESC LIMIT ?")
+        params.append(max(1, min(int(limit), 50)))
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            desc, rows = await loop.run_in_executor(None, self._exec_read,
+                                                    sql, tuple(params))
+        names = [d[0] for d in desc]
+        return [dict(zip(names, r)) for r in rows]
+
     # -------------------------------------------------------------- delete
     async def count_owner_messages(self) -> int:
         sql = "SELECT COUNT(*) FROM messages WHERE is_out=1"

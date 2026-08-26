@@ -19,6 +19,12 @@ from ai_client import AIClient
 from message_store import MessageStore
 from soul_manager import SoulManager
 
+try:  # el toolbox es opcional para facilitar tests
+    from agent_tools import TelegramToolbox, ToolContext
+except ImportError:  # pragma: no cover
+    TelegramToolbox = None
+    ToolContext = None
+
 log = logging.getLogger("soul.responder")
 
 
@@ -80,10 +86,12 @@ def _format_chat_memory(ctx: dict | None) -> str:
 
 class Responder:
     def __init__(self, store: MessageStore, ai: AIClient, soul: SoulManager,
-                 responder_cfg: dict, safety_cfg: dict, owner_id: int):
+                 responder_cfg: dict, safety_cfg: dict, owner_id: int,
+                 toolbox=None):
         self.store = store
         self.ai = ai
         self.soul = soul
+        self.toolbox = toolbox
         cfg = responder_cfg
         self.group_reply_mode = cfg.get("group_reply_mode", "mention")
         self.group_cooldown = float(cfg.get("group_reply_cooldown_seconds", 8))
@@ -215,7 +223,13 @@ class Responder:
         # el último resumen y la conversación inmediata sigue disponible abajo.
         chat_ctx = await self.soul.refresh_chat_context(ctx.chat_id)
         memory = _format_chat_memory(chat_ctx)
-        system = RESPONSE_SYSTEM_PROMPT_TEMPLATE.format(soul=soul, chat_memory=memory)
+        use_tools = (self.toolbox is not None and self.toolbox.enabled
+                     and not ctx.has_photo)
+        system = RESPONSE_SYSTEM_PROMPT_TEMPLATE.format(soul=soul,
+                                                        chat_memory=memory)
+        if use_tools:
+            # Sección extra que explica a la IA qué tools tiene disponibles
+            system += self.toolbox.system_prompt_section()
         conversation = await self._build_conversation_messages(ctx)
         if not conversation:
             conversation = [{
@@ -223,15 +237,43 @@ class Responder:
                 "content": f"{ctx.incoming_from_name}: {ctx.incoming_text}",
             }]
         try:
-            text = await self.ai.reply_with_image_context(
-                system=system,
-                conversation=conversation,
-                image_bytes=ctx.photo_bytes if ctx.has_photo else None,
-                mime=ctx.photo_mime,
-                caption=ctx.caption,
-            )
+            if use_tools:
+                # Flujo con function calling: la IA puede ejecutar acciones
+                # (reaccionar, memorizar, programar, buscar...) y además
+                # devuelve su respuesta de texto final.
+                tool_ctx = ToolContext(
+                    chat_id=ctx.chat_id,
+                    chat_type=ctx.chat_type,
+                    chat_title=ctx.chat_title,
+                    incoming_message_id=ctx.incoming_message_id,
+                    from_id=ctx.incoming_from_id,
+                    from_name=ctx.incoming_from_name,
+                )
+                text, executed = await self.toolbox.run_tool_loop(
+                    self.ai, system, conversation, tool_ctx)
+                if executed:
+                    names = ", ".join(
+                        f"{e.name}({'ok' if e.ok else 'ERR'})" for e in executed)
+                    log.info("Tools executed for chat=%s: %s",
+                             ctx.chat_id, names)
+            elif ctx.has_photo:
+                text = await self.ai.reply_with_image_context(
+                    system=system,
+                    conversation=conversation,
+                    image_bytes=ctx.photo_bytes,
+                    mime=ctx.photo_mime,
+                    caption=ctx.caption,
+                )
+            else:
+                text = await self.ai.chat(
+                    [{"role": "system", "content": system}, *conversation],
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                ).text
         except Exception as e:
             log.error("Reply generation failed: %s", e)
+            return None
+        if not text:
             return None
         text = text.strip()
         # Sanity: quitar comillas envolventes si el modelo las puso
@@ -251,7 +293,7 @@ class Responder:
 
     def stats(self) -> dict:
         now = time.time()
-        return {
+        out = {
             "group_reply_mode": self.group_reply_mode,
             "group_cooldown": self.group_cooldown,
             "private_cooldown": self.private_cooldown,
@@ -259,4 +301,7 @@ class Responder:
             "prob_always": self.prob_always,
             "replies_last_60s": sum(1 for t in self._reply_history if now - t < 60),
             "max_replies_per_minute": self.max_replies_per_minute,
+            "tools_active": bool(self.toolbox is not None
+                                  and self.toolbox.enabled),
         }
+        return out

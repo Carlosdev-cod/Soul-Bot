@@ -28,6 +28,11 @@ Comandos del dueño (solo él, en cualquier chat):
   /soul_scan_private — backfill solo de chats privados
   /soul_scan <id>    — backfill solo del chat indicado (id numérico)
   /soul_learn        — muestra el último "learning summary" generado por la IA
+  /soul_tools on|off — activa/desactiva las tools de la IA (function calling)
+  /soul_memory       — lista o busca las memorias persistentes de la IA
+  /soul_forget <key> — elimina una memoria
+  /soul_tasks        — mensajes programados pendientes
+  /soul_cancel <id>  — cancela un mensaje programado
 
 Toda la captura de mensajes es local (SQLite en data/), nada se envía fuera
 salvo a tu endpoint de IA para análisis/respuestas.
@@ -47,14 +52,17 @@ from pathlib import Path
 
 from pyrogram import Client, filters
 from pyrogram.types import Message, User
-from pyrogram.enums import ChatType
+from pyrogram.enums import ChatAction, ChatType
 
 import config_store
+from agent_tools import TelegramToolbox
 from ai_client import AIClient, AIError
 from auth_manager import AuthManager
 from backfill import BackfillRunner
+from memory_store import MemoryStore
 from message_store import MessageStore
 from responder import ReplyContext, Responder
+from scheduler import MessageScheduler
 from soul_manager import SoulManager
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -108,11 +116,14 @@ class SoulAgent:
         self.ai = AIClient(cfg)
         self.auth = AuthManager(str(CONFIG_PATH))
         self.soul = SoulManager(self.store, self.ai, cfg.get("soul", {}))
-        self.responder = Responder(
-            self.store, self.ai, self.soul,
-            cfg.get("responder", {}),
-            cfg.get("safety", {}),
-            self.auth.owner_id,
+        # Memoria persistente + scheduler de mensajes programados + toolbox
+        # de function calling (Kurigram <-> IA)
+        tools_cfg = cfg.get("tools", {})
+        self.typing_indicator = bool(tools_cfg.get("typing_indicator", True))
+        self.memory = MemoryStore(str(BASE_DIR / "data" / "memories.db"))
+        self.scheduler = MessageScheduler(
+            str(BASE_DIR / "data" / "scheduled_messages.json"),
+            send_fn=self._scheduled_send,
         )
         self.auto_reply_enabled = bool(cfg.get("responder", {}).get(
             "auto_reply_enabled", True))
@@ -134,6 +145,23 @@ class SoulAgent:
             in_memory=False,
         )
         self.me: User | None = None
+        self.toolbox = TelegramToolbox(
+            client=self.app,
+            store=self.store,
+            memory=self.memory,
+            scheduler=self.scheduler,
+            auth=self.auth,
+            soul_provider=self.soul.get_soul,
+            owner_id=self.auth.owner_id,
+            cfg=tools_cfg,
+        )
+        self.responder = Responder(
+            self.store, self.ai, self.soul,
+            cfg.get("responder", {}),
+            cfg.get("safety", {}),
+            self.auth.owner_id,
+            toolbox=self.toolbox,
+        )
 
     # -------------------------------------------------------------- lifecycle
     async def start(self) -> None:
@@ -146,6 +174,8 @@ class SoulAgent:
             self.auth.set_owner(self.me.id)
             log.info("Owner auto-set to %s", self.me.id)
         self._register_handlers()
+        # Scheduler de mensajes programados (tools de la IA)
+        self.scheduler.start()
         # Intentar construir Soul.md inicial si ya hay mensajes previos
         await self.soul.maybe_initial_build()
         # Lanzar refresh loop
@@ -153,6 +183,10 @@ class SoulAgent:
         # Probe de visión
         vok = await self.ai.is_vision_enabled()
         log.info("Vision enabled: %s", vok)
+        tstats = self.toolbox.stats()
+        log.info("Agent tools: enabled=%s (%d tools, budget=%d/reply)",
+                 tstats["enabled"], tstats["tools_count"],
+                 tstats["max_executions_per_reply"])
         log.info("Soul Agent ready. Owner=%s. Groups=%s Users=%s",
                  self.auth.owner_id, len(self.auth.group_ids),
                  len(self.auth.user_ids))
@@ -166,6 +200,7 @@ class SoulAgent:
                 await self._refresh_task
             except asyncio.CancelledError:
                 pass
+        await self.scheduler.stop()
         await self.ai.aclose()
         try:
             await self.app.stop()
@@ -359,18 +394,63 @@ class SoulAgent:
             return
         log.info("Generating reply in chat=%s reason=ok mention=%s reply_to_me=%s",
                  chat.id, is_mention, is_reply_to_me)
+        # Indicador "escribiendo…" mientras la IA genera (más natural)
+        typing_task = None
+        if self.typing_indicator:
+            typing_task = asyncio.create_task(self._typing_loop(chat.id))
         try:
             reply_text = await self.responder.generate_reply(ctx)
         except Exception as e:
             log.exception("Reply generation error: %s", e)
-            return
+            reply_text = None
+        finally:
+            if typing_task is not None:
+                typing_task.cancel()
+                try:
+                    await typing_task
+                except (asyncio.CancelledError, Exception):
+                    pass
         if not reply_text:
             return
+        await self._safe_reply(message, reply_text)
+
+    async def _safe_reply(self, message: Message, text: str) -> None:
+        """Envía un reply partiéndolo si supera el límite de Telegram (4096)."""
+        LIMIT = 4000
+        chunks = [text[i:i + LIMIT] for i in range(0, len(text), LIMIT)] or [""]
+        sent = False
+        for chunk in chunks:
+            try:
+                await message.reply(chunk, disable_notification=True)
+                sent = True
+            except Exception as e:
+                log.error("Failed to send reply chunk: %s", e)
+                return
+        if sent:
+            log.info("Replied in chat=%s: %r", message.chat.id, text[:80])
+
+    async def _typing_loop(self, chat_id: int) -> None:
+        """Mantiene el estado 'escribiendo…' renovándolo cada 4s (dura ~5s)."""
         try:
-            await message.reply(reply_text, disable_notification=True)
-            log.info("Replied in chat=%s: %r", chat.id, reply_text[:80])
-        except Exception as e:
-            log.error("Failed to send reply: %s", e)
+            while True:
+                try:
+                    await self.app.send_chat_action(chat_id, ChatAction.TYPING)
+                except Exception as e:
+                    log.debug("Chat action failed: %s", e)
+                    return
+                await asyncio.sleep(4.0)
+        except asyncio.CancelledError:
+            pass
+
+    async def _scheduled_send(self, chat_id: int, text: str,
+                              reply_to_message_id: int | None) -> None:
+        """Callback del MessageScheduler: envía un mensaje programado.
+
+        Al ser un mensaje saliente de la cuenta, el handler de captura lo
+        guardará automáticamente en el store (corpus Soul.md).
+        """
+        await self.app.send_message(chat_id, text,
+                                    reply_to_message_id=reply_to_message_id)
 
     def _is_mention_of_me(self, message: Message) -> bool:
         text = (message.text or message.caption or "")
@@ -548,6 +628,16 @@ class SoulAgent:
             await self._handle_delete_analyzed(message)
         elif cmd == "soul_delete_unanalyzed":
             await self._handle_delete_unanalyzed(message)
+        elif cmd == "soul_tools":
+            await self._handle_tools_toggle(message, args)
+        elif cmd == "soul_memory":
+            await self._handle_memory(message, args)
+        elif cmd == "soul_forget":
+            await self._handle_forget(message, args)
+        elif cmd == "soul_tasks":
+            await self._handle_tasks(message)
+        elif cmd == "soul_cancel":
+            await self._handle_cancel_task(message, args)
 
     async def _handle_models_command(self, message: Message) -> None:
         """Lista modelos o activa uno con `/models <model_id>`."""
@@ -856,6 +946,129 @@ class SoulAgent:
             quote=True
         )
 
+    # -------------------------------------------------------------- tools IA
+    async def _handle_tools_toggle(self, message: Message, args: str) -> None:
+        """Activa/desactiva el sistema de tools (function calling) de la IA."""
+        val = args.strip().lower()
+        if val in ("on", "1", "true", "si", "sí"):
+            enable = True
+        elif val in ("off", "0", "false", "no"):
+            enable = False
+        else:
+            state = "✅ activadas" if self.toolbox.enabled else "⏸️ desactivadas"
+            await message.reply(
+                f"Uso: /soul_tools on|off\n\nEstado actual: {state}\n\n"
+                "Con las tools activas la IA puede ejecutar acciones reales "
+                "en Telegram: reaccionar, guardar recuerdos, programar "
+                "mensajes, buscar en tu historial…",
+                quote=True
+            )
+            return
+        self.toolbox.enabled = enable
+        self._update_config(lambda cfg: cfg.setdefault(
+            "tools", {}).__setitem__("enabled", enable))
+        if enable:
+            await message.reply(
+                "✅ Tools de la IA **activadas**.\n\n"
+                "Ahora puede: reaccionar con emojis, guardar/recuperar "
+                "recuerdos, programar mensajes, buscar en tu historial y más "
+                f"({self.toolbox.stats()['tools_count']} tools).",
+                quote=True
+            )
+        else:
+            await message.reply(
+                "⏸️ Tools de la IA **desactivadas**. Seguirá respondiendo "
+                "solo texto.",
+                quote=True
+            )
+
+    async def _handle_memory(self, message: Message, args: str) -> None:
+        """Lista o busca las memorias persistentes guardadas por la IA."""
+        query = args.strip()
+        if query:
+            rows = await self.memory.recall(query, limit=10)
+            title = f"🔎 Memorias que coinciden con «{query}»:"
+        else:
+            rows = await self.memory.list_recent(limit=20)
+            title = "🧠 Últimas memorias del agente:"
+        total = await self.memory.count()
+        if not rows:
+            await message.reply(
+                "📭 No hay memorias que mostrar.\n\n"
+                "La IA crea recuerdos automáticamente con la tool "
+                "`save_memory` cuando le pides recordar algo.",
+                quote=True
+            )
+            return
+        lines = [title, ""]
+        for r in rows:
+            content = (r["content"] or "").replace("\n", " ")[:100]
+            lines.append(f"• `{r['key']}`: {content}")
+        lines.append("")
+        lines.append(f"Total: {total} | Borrar: /soul_forget <key>")
+        await message.reply("\n".join(lines), quote=True)
+
+    async def _handle_forget(self, message: Message, args: str) -> None:
+        """Elimina una memoria por su key exacta."""
+        key = args.strip()
+        if not key:
+            await message.reply(
+                "Uso: /soul_forget <key>\n\n"
+                "Ver memorias: /soul_memory",
+                quote=True
+            )
+            return
+        removed = await self.memory.forget(key)
+        if removed:
+            await message.reply(f"🗑️ Memoria `{key}` eliminada.", quote=True)
+        else:
+            await message.reply(
+                f"ℹ️ No existe una memoria con la key `{key}`.", quote=True)
+
+    async def _handle_tasks(self, message: Message) -> None:
+        """Lista los mensajes programados pendientes."""
+        tasks = await self.scheduler.pending()
+        if not tasks:
+            await message.reply(
+                "📭 No hay mensajes programados pendientes.\n\n"
+                "La IA puede programarlos con la tool `schedule_message` "
+                "(ej: «recuérdame en 2 horas…»).",
+                quote=True
+            )
+            return
+        now = time.time()
+        lines = ["⏰ Mensajes programados:", ""]
+        for t in tasks:
+            secs = t["send_at"] - now
+            if secs >= 3600:
+                when = f"en {secs / 3600:.1f} h"
+            elif secs >= 60:
+                when = f"en {secs / 60:.0f} min"
+            else:
+                when = f"en {max(0, secs):.0f} s"
+            text = (t["text"] or "").replace("\n", " ")[:80]
+            lines.append(f"• `{t['id']}` → chat {t['chat_id']} ({when}): {text}")
+        lines.append("")
+        lines.append(f"Total: {len(tasks)} | Cancelar: /soul_cancel <id>")
+        await message.reply("\n".join(lines), quote=True)
+
+    async def _handle_cancel_task(self, message: Message, args: str) -> None:
+        """Cancela un mensaje programado pendiente por su id."""
+        task_id = args.strip()
+        if not task_id:
+            await message.reply(
+                "Uso: /soul_cancel <task_id>\n\nVer pendientes: /soul_tasks",
+                quote=True
+            )
+            return
+        ok = await self.scheduler.cancel(task_id)
+        if ok:
+            await message.reply(f"✅ Tarea `{task_id}` cancelada.", quote=True)
+        else:
+            await message.reply(
+                f"ℹ️ La tarea `{task_id}` no existe o ya no está pendiente.",
+                quote=True)
+
     # -------------------------------------------------------------- status
     async def _format_status(self) -> str:
         s = self.soul.stats()
@@ -910,6 +1123,19 @@ class SoulAgent:
             f"Replies en últimos 60s: {r['replies_last_60s']}/{r['max_replies_per_minute']}"
         )
         lines.append(f"Pausado: {'sí' if self.paused else 'no'}")
+        # Tools / memoria / scheduler
+        try:
+            ts = self.toolbox.stats()
+            lines.append(
+                f"Tools IA: {'✅ activas' if ts['enabled'] else '⏸️ desactivadas'} "
+                f"({ts['tools_count']} tools | {ts['total_executions']} ejecuciones "
+                f"| {ts['total_errors']} errores)"
+            )
+            lines.append(f"Memorias guardadas: {await self.memory.count()}")
+            lines.append(
+                f"Mensajes programados: {await self.scheduler.pending_count()}")
+        except Exception:
+            pass
         lines.append(
             f"Visión: {'✅' if getattr(self.ai, '_vision_supported', False) else '❌'} "
             f"(probe en {time.ctime(getattr(self.ai, '_vision_checked_at', 0)) or 'nunca'})"
@@ -1022,6 +1248,13 @@ _HELP_TEXT = """🪪 **Soul Agent** — comandos del dueño
 /models — listar los modelos disponibles de la API
 /models <model_id> — activar un modelo (ej: /models gemini-2.0-flash)
 /models config — volver al modelo por defecto de config.json
+
+🛠️ Tools de la IA (function calling):
+/soul_tools on|off — activa/desactiva que la IA ejecute acciones reales
+/soul_memory [texto] — lista o busca los recuerdos persistentes de la IA
+/soul_forget <key> — elimina un recuerdo
+/soul_tasks — mensajes programados pendientes
+/soul_cancel <id> — cancela un mensaje programado
 
 /soul_help — esta ayuda
 """

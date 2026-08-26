@@ -10,6 +10,10 @@ que usa el modelo Gemini 3.6 flash para:
 El wrapper detecta automáticamente si el endpoint soporta visión; si no la
 soporta (caso actual del proxy), degrada elegantemente y responde usando solo
 el caption/metadatos de la imagen.
+
+También soporta function calling (tools): si el endpoint no acepta el
+parámetro `tools`, se reintenta la petición sin él y se marca como no
+soportado durante un intervalo (re-probe periódico), igual que la visión.
 """
 from __future__ import annotations
 
@@ -55,6 +59,10 @@ class AIClient:
         self._vision_supported: bool | None = None
         self._vision_checked_at: float = 0.0
         self._vision_recheck_interval = 6 * 3600
+        # Function calling: None = sin datos, True/False = sondado
+        self._tools_supported: bool | None = None
+        self._tools_checked_at: float = 0.0
+        self._tools_recheck_interval = 6 * 3600
         self._client = httpx.AsyncClient(
             base_url=self.base_url,
             headers={"Authorization": f"Bearer {self.api_key}"},
@@ -87,6 +95,30 @@ class AIClient:
         self.vision_model = model
         self._vision_supported = None
         self._vision_checked_at = 0.0
+
+    # -------------------------------------------------------------- tools
+    def _tools_probe_due(self) -> bool:
+        """True si toca re-probar el soporte de tools tras un fallo."""
+        if self._tools_supported is None:
+            return False  # aún no sondado: se intenta con tools directamente
+        return (time.time() - self._tools_checked_at) >= self._tools_recheck_interval
+
+    async def is_tools_enabled(self) -> bool:
+        """Indica si el endpoint soporta function calling (tools).
+
+        No lanza peticiones: refleja el estado de la última sonda.
+        """
+        return bool(self._tools_supported)
+
+    def _strip_tools(self, extra: dict | None) -> dict | None:
+        """Quita tools/tool_choice del payload si el endpoint no los soporta."""
+        if not extra:
+            return extra
+        if "tools" not in extra and "tool_choice" not in extra:
+            return extra
+        cleaned = {k: v for k, v in extra.items()
+                   if k not in ("tools", "tool_choice")}
+        return cleaned or None
 
     # -------------------------------------------------------------- helpers
     def _payload(self, messages: list[dict], model: str | None = None,
@@ -121,8 +153,43 @@ class AIClient:
     async def chat(self, messages: list[dict], *, model: str | None = None,
                    temperature: float | None = None, max_tokens: int | None = None,
                    extra: dict | None = None) -> ChatResponse:
-        payload = self._payload(messages, model, temperature, max_tokens, extra)
-        data = await self._post_chat(payload)
+        """POST /chat/completions con soporte opcional de `tools`.
+
+        Degradación elegante de function calling: si el endpoint rechaza
+        el payload con tools (error HTTP), se reintenta UNA vez sin tools,
+        se marca `_tools_supported=False` (re-probe cada 6h) y se devuelve
+        la respuesta de texto. Así el agente sigue funcionando igual en
+        endpoints sin soporte de tools.
+        """
+        use_extra = dict(extra) if extra else None
+        has_tools = bool(use_extra and use_extra.get("tools"))
+        if has_tools and self._tools_supported is False and \
+                not self._tools_probe_due():
+            # Endpoint ya sondado sin soporte: ir directo a texto plano
+            use_extra = self._strip_tools(use_extra)
+            has_tools = False
+        payload = self._payload(messages, model, temperature, max_tokens,
+                                use_extra)
+        try:
+            data = await self._post_chat(payload)
+        except AIError as e:
+            if has_tools and "Network error" not in str(e):
+                # Podría ser rechazo del parámetro tools: reintentar sin él
+                log.warning("Chat con tools falló (%s); reintentando sin "
+                            "tools (modo degradado)", e)
+                self._tools_supported = False
+                self._tools_checked_at = time.time()
+                payload = self._payload(messages, model, temperature,
+                                        max_tokens, self._strip_tools(use_extra))
+                data = await self._post_chat(payload)
+            else:
+                raise
+        else:
+            if has_tools and self._tools_supported is not True:
+                # La petición con tools funcionó: el endpoint los acepta
+                # (aunque el modelo puede elegir no usarlos)
+                self._tools_supported = True
+                self._tools_checked_at = time.time()
         try:
             text = data["choices"][0]["message"]["content"] or ""
         except (KeyError, IndexError) as e:

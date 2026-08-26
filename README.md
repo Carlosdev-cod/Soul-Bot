@@ -48,6 +48,8 @@
   3. **Conversación inmediata:** los últimos mensajes del mismo chat.
 - Responde únicamente en grupos/usuarios autorizados.
 - Puede analizar imágenes si el endpoint de IA soporta visión.
+- **Ejecuta acciones reales en Telegram** mediante function calling: reacciona con emojis, guarda recuerdos persistentes, programa mensajes futuros y busca en todo tu historial (ver [Tools de la IA](#tools-de-la-ia-function-calling)).
+- Muestra el indicador «escribiendo…» mientras genera cada respuesta.
 
 ## Arquitectura
 
@@ -56,17 +58,19 @@ Telegram / cuenta de usuario
           │
           ▼
      soul_agent.py
-   handlers + captura
+   handlers + captura + typing
       │          │
       ▼          ▼
-message_store  responder
- SQLite         │
-      │         ├── contexto reciente del chat
-      │         ├── memoria contextual persistente
-      │         └── Soul.md + reglas de personalidad
-      ▼         ▼
+message_store  responder ──── agent_tools.py
+ SQLite         │              (function calling:
+      │         ├── contexto reciente del chat     tools Kurigram↔IA)
+      │         ├── memoria contextual persistente      │
+      │         ├── Soul.md + reglas de personalidad    ├── memory_store
+      │         └── tool loop: acciones reales          ├── scheduler
+      ▼         ▼                                      └── search_history
   soul_manager ─── ai_client.py
   aprendizaje       API OpenAI-compatible
+                   (tools con degradación elegante)
 ```
 
 ### Memoria por chat
@@ -228,24 +232,88 @@ Tras responder en un chat, el agente espera `skip_if_replied_recently_seconds` (
 
 Borrar mensajes de la base no modifica automáticamente `Soul.md`; si quieres eliminar aprendizajes, regenera el archivo después de limpiar los datos.
 
+## Tools de la IA (function calling)
+
+El agente no solo **responde texto**: cuando generas una respuesta con un endpoint compatible con tools (OpenAI function calling), la IA puede **ejecutar acciones reales** en Telegram a través de Kurigram durante la propia generación:
+
+| Tool | Qué hace | Guardarrail |
+|---|---|---|
+| `react_to_message` | Reacciona con un emoji al mensaje entrante | Solo emojis válidos de Telegram |
+| `send_message` | Envía un mensaje como el dueño | Solo al chat actual o a chats autorizados |
+| `search_history` | Busca en TODO el historial capturado | Resultados acotados, LIKE escapado |
+| `get_chat_history` | Lee mensajes recientes de un chat | Máx. 40 mensajes |
+| `save_memory` | Guarda un recuerdo persistente (SQLite) | Clave + contenido acotados |
+| `recall_memories` | Recupera recuerdos guardados | Prioriza key exacta > key > contenido |
+| `forget_memory` | Elimina un recuerdo por key | Solo keys existentes |
+| `schedule_message` | Programa un mensaje futuro | Delay 10 s – 7 días, tope de 20 tareas |
+| `list_scheduled` | Lista tareas programadas pendientes | — |
+| `cancel_scheduled` | Cancela una tarea por id | Solo pendientes |
+| `get_chat_info` | Metadatos de un chat (título, miembros) | Solo lectura |
+| `read_soul` | Lee su propio `Soul.md` | Truncado a 6000 chars |
+
+### Cómo funciona el ciclo
+
+1. El `Responder` arma el prompt (Soul.md + memoria del chat + conversación) y añade una sección que explica las tools disponibles.
+2. `AIClient.chat()` envía el payload con `tools` + `tool_choice: auto`.
+3. Si el modelo devuelve `tool_calls`, `TelegramToolbox` los ejecuta (con presupuesto y guards) y devuelve los resultados JSON como mensajes `role: tool`.
+4. El ciclo se repite hasta `max_tool_rounds` (por defecto 3) o hasta que el modelo produce el texto final, que se envía como respuesta normal.
+
+### Degradación elegante
+
+Si el endpoint no soporta el parámetro `tools` (HTTP 400/422 en muchos proxies), el cliente reintenta automáticamente **sin tools**, marca el endpoint como no compatible durante 6 h y el agente sigue respondiendo solo texto, exactamente como antes. No hay que configurar nada.
+
+### Seguridad
+
+- `tools.enabled: false` (o `/soul_tools off`) desactiva todo el sistema en caliente.
+- Presupuesto de ejecuciones por respuesta (`max_executions_per_reply`, por defecto 6): un modelo en bucle no puede spamear acciones.
+- `send_message` fuera del chat actual exige chat autorizado **y** `allow_send_to_authorized_chats: true`.
+- Cada ejecución se audita en el log con tool, chat y resultado.
+
+### Configuración
+
+```json
+"tools": {
+  "enabled": true,
+  "max_tool_rounds": 3,
+  "max_executions_per_reply": 6,
+  "allow_send_to_authorized_chats": true,
+  "max_scheduled_messages": 20,
+  "max_send_text_length": 3500,
+  "typing_indicator": true
+}
+```
+
+### Comandos de tools
+
+- `/soul_tools on|off` — activa/desactiva las tools en caliente.
+- `/soul_memory [texto]` — lista o busca los recuerdos persistentes de la IA.
+- `/soul_forget <key>` — elimina un recuerdo.
+- `/soul_tasks` — mensajes programados pendientes.
+- `/soul_cancel <id>` — cancela un mensaje programado.
+
+Ejemplos de uso natural: «recuerda que Ana prefiere café» → `save_memory`; «recuérdame en 2 horas llamar a Juan» → `schedule_message`; «qué te dije ayer sobre el viaje» → `search_history`.
+
 ## Estructura
 
 ```text
 Soul-Bot/
-├── soul_agent.py       # Cliente Telegram, handlers y ciclo principal
-├── ai_client.py        # Cliente async OpenAI-compatible + visión
+├── soul_agent.py       # Cliente Telegram, handlers, typing y ciclo principal
+├── agent_tools.py      # Tools function calling (Kurigram ↔ IA) + loop agéntico
+├── memory_store.py     # Memorias persistentes de la IA (SQLite)
+├── scheduler.py        # Mensajes programados (persistencia atómica + reintentos)
+├── ai_client.py        # Cliente async OpenAI-compatible + visión + tools
 ├── soul_manager.py     # Soul.md y memoria contextual por chat
-├── responder.py        # Decisión, contexto y generación de respuestas
-├── message_store.py    # SQLite WAL: mensajes y chat_context (dedup real)
+├── responder.py        # Decisión, contexto y generación (con tool loop)
+├── message_store.py    # SQLite WAL: mensajes, chat_context y búsqueda (dedup real)
 ├── auth_manager.py     # Autorizaciones persistentes
 ├── config_store.py     # Escritura atómica read-modify-write de config.json
 ├── backfill.py         # Escaneo/deduplicación de historial
 ├── progress.py         # Progreso de consola y Telegram
-├── tests/              # Suite pytest (sin necesidad de Telegram)
+├── tests/              # Suite pytest (73 tests, sin necesidad de Telegram)
 ├── config.example.json # Configuración de ejemplo
 ├── requirements.txt    # Dependencias
 ├── Soul.md             # Generado localmente, no se versiona
-├── data/               # SQLite local, no se versiona
+├── data/               # SQLite local (mensajes + memorias + tareas), no se versiona
 ├── session/            # Sesión Telegram, no se versiona
 └── logs/               # Logs, no se versiona
 ```

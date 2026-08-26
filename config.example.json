@@ -59,5 +59,14 @@
   },
   "capture": {
     "only_authorized_incoming": true
+  },
+  "tools": {
+    "enabled": true,
+    "max_tool_rounds": 3,
+    "max_executions_per_reply": 6,
+    "allow_send_to_authorized_chats": true,
+    "max_scheduled_messages": 20,
+    "max_send_text_length": 3500,
+    "typing_indicator": true
   }
 }
